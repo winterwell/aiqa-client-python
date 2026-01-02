@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiqa-client"
-version = "0.4.1"
+version = "0.4.3"
 description = "OpenTelemetry-based Python client for tracing functions and sending traces to the AIQA server"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -44,10 +44,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/winterstein/aiqa"
-Documentation = "https://github.com/winterstein/aiqa/tree/main/client-python"
-Repository = "https://github.com/winterstein/aiqa"
-Issues = "https://github.com/winterstein/aiqa/issues"
+Homepage = "https://github.com/winterwell/aiqa-client-python"
+Documentation = "https://github.com/winterwell/aiqa-client-python"
+Repository = "https://github.com/winterwell/aiqa-client-python"
+Issues = "https://github.com/winterwell/aiqa-client-python/issues"
 
 [tool.setuptools]
 packages = ["aiqa"]
