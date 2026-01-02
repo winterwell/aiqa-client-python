@@ -6,3 +6,4 @@ build/
 *.pyo
 *.pyd
 .Python
+.pypirc
