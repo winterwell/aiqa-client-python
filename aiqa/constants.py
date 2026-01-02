@@ -3,4 +3,4 @@ Constants used across the AIQA client package.
 """
 
 AIQA_TRACER_NAME = "aiqa-tracer"
-VERSION = "0.4.3" # automatically updated by set-version-json.sh
+VERSION = "0.4.4" # automatically updated by set-version-json.sh
