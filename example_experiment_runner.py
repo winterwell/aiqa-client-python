@@ -4,6 +4,7 @@ Example usage of the ExperimentRunner class.
 
 import asyncio
 import os
+import random
 from dotenv import load_dotenv
 from aiqa import ExperimentRunner
 
@@ -171,6 +172,6 @@ if __name__ == "__main__":
     # asyncio.run(example_basic_usage())
     # asyncio.run(example_with_experiment_setup())
     # asyncio.run(example_stepwise())
-    print(f"Please uncomment one of the examples above to run it.")
-    print(f"Make sure to set your dataset_id and organisation_id in the example functions.")
+    print("Please uncomment one of the examples above to run it.")
+    print("Make sure to set your dataset_id and organisation_id in the example functions.")
 

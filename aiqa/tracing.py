@@ -7,6 +7,7 @@ import json
 import logging
 import inspect
 import os
+import copy
 from typing import Any, Callable, Optional, List
 from functools import wraps
 from opentelemetry import trace
@@ -116,6 +117,30 @@ class TracingOptions:
 
 
 
+def _shallow_copy_for_filtering(value: Any) -> Any:
+    """
+    Shallow copy mutable structures needed for safe filtering (to avoid mutating originals).
+    Only copies what's necessary for filtering - full serialization happens immediately after.
+    
+    Args:
+        value: The value to shallow copy
+        
+    Returns:
+        A shallow copy of mutable structures, or the original value for immutable types
+    """
+    # Immutable types: return as-is
+    if value is None or isinstance(value, (str, int, float, bool, bytes, type)):
+        return value
+    
+    # For dicts and lists, shallow copy is sufficient for filtering
+    if isinstance(value, dict):
+        return value.copy()  # Shallow copy - nested structures will be serialized anyway
+    if isinstance(value, (list, tuple)):
+        return list(value) if isinstance(value, list) else tuple(value)  # Shallow copy
+    
+    # For other types, return as-is (they'll be serialized immediately)
+    return value
+
 
 def _prepare_input(args: tuple, kwargs: dict) -> Any:
     """Prepare input for span attributes.
@@ -128,6 +153,8 @@ def _prepare_input(args: tuple, kwargs: dict) -> Any:
         return None
     if len(args) == 1 and not kwargs:
         return args[0]  # Don't serialize here - will be serialized later
+    if kwargs and not args:
+        return kwargs
     # Multiple args or kwargs - combine into dict
     result = {}
     if args:
@@ -143,7 +170,10 @@ def _prepare_and_filter_input(
     filter_input: Optional[Callable[[Any], Any]],
     ignore_input: Optional[List[str]],
 ) -> Any:
-    """Prepare and filter input for span attributes."""
+    """
+    Prepare and filter input for span attributes.
+    Copies mutable structures to avoid shared mutations affecting traces.
+    """
     # Handle "self" in ignore_input by skipping the first argument
     filtered_args = args
     filtered_kwargs = kwargs.copy() if kwargs else {}
@@ -186,7 +216,9 @@ def _prepare_and_filter_output(
         for key in ignore_output:
             if key in output_data:
                 del output_data[key]
-    return output_data
+    
+    # Serialize immediately to create immutable result (removes mutable structures)
+    return serialize_for_span(output_data)
 
 
 def _handle_span_exception(span: trace.Span, exception: Exception) -> None:
@@ -393,6 +425,9 @@ def _finalize_span_success_common(
     Common logic for finalizing a span with success status.
     Extracts token usage and provider/model from result, sets output attribute, and sets status to OK.
     
+    Serializes output immediately to capture its state when the function returns,
+    preventing mutations from affecting the trace.
+    
     Args:
         span: The span to finalize
         result_for_metadata: Value to extract token usage and provider/model from
@@ -404,9 +439,11 @@ def _finalize_span_success_common(
     _extract_and_set_token_usage(span, result_for_metadata)
     _extract_and_set_provider_and_model(span, result_for_metadata)
     
+    # Prepare, filter, and serialize output (serialization happens in _prepare_and_filter_output)
     output_data = _prepare_and_filter_output(output_data, filter_output, ignore_output)
     if output_data is not None:
-        span.set_attribute("output", serialize_for_span(output_data))
+        # output_data is already serialized (immutable) from _prepare_and_filter_output
+        span.set_attribute("output", output_data)
     span.set_status(Status(StatusCode.OK))
 
 
@@ -440,7 +477,8 @@ class TracedGenerator:
         
         try:
             value = next(self._generator)
-            self._yielded_values.append(value)
+            # Serialize immediately to create immutable result (removes mutable structures)
+            self._yielded_values.append(serialize_for_span(value))
             return value
         except StopIteration:
             self._exhausted = True
@@ -514,7 +552,8 @@ class TracedAsyncGenerator:
         
         try:
             value = await self._generator.__anext__()
-            self._yielded_values.append(value)
+            # Serialize immediately to create immutable result (removes mutable structures)
+            self._yielded_values.append(serialize_for_span(value))
             return value
         except StopAsyncIteration:
             self._exhausted = True
@@ -590,20 +629,6 @@ def WithTracing(
         def my_function(x, y):
             return x + y
         
-        @WithTracing
-        async def my_async_function(x, y):
-            return x + y
-        
-        @WithTracing
-        def my_generator(n):
-            for i in range(n):
-                yield i * 2
-        
-        @WithTracing
-        async def my_async_generator(n):
-            for i in range(n):
-                yield i * 2
-        
         @WithTracing(name="custom_name")
         def another_function():
             pass
@@ -624,7 +649,12 @@ def WithTracing(
         # This ensures initialization only happens when tracing is actually used
         
         def _setup_span(span: trace.Span, input_data: Any) -> bool:
-            """Setup span with input data. Returns True if span is recording."""
+            """
+            Setup span with input data. Returns True if span is recording.
+            
+            Serializes input immediately to capture its state at function start,
+            preventing mutations from affecting the trace.
+            """
             if not span.is_recording():
                 logger.warning(f"Span {fn_name} is not recording - will not be exported")
                 return False
@@ -637,6 +667,8 @@ def WithTracing(
                 span.set_attribute("gen_ai.component.id", component_tag)
             
             if input_data is not None:
+                # Serialize input immediately to capture state at function start
+                # input_data has already been copied in _prepare_and_filter_input
                 span.set_attribute("input", serialize_for_span(input_data))
             
             trace_id = format(span.get_span_context().trace_id, "032x")

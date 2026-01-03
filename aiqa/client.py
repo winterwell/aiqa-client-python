@@ -239,6 +239,7 @@ def _attach_aiqa_processor(provider: TracerProvider) -> None:
         exporter = AIQASpanExporter(
             server_url=os.getenv("AIQA_SERVER_URL"),
             api_key=os.getenv("AIQA_API_KEY"),
+            # max_buffer_spans will be read from AIQA_MAX_BUFFER_SPANS env var by the exporter
         )
         provider.add_span_processor(BatchSpanProcessor(exporter))
         global client

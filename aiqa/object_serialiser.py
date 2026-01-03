@@ -13,6 +13,30 @@ from typing import Any, Callable, Set
 
 logger = logging.getLogger(LOG_TAG)
 
+def sanitize_string_for_utf8(text: str) -> str:
+    """
+    Sanitize a string to remove surrogate characters that can't be encoded to UTF-8.
+    Surrogate characters (U+D800 to U+DFFF) are invalid in UTF-8 and can cause encoding errors.
+    
+    Args:
+        text: The string to sanitize
+        
+    Returns:
+        A string with surrogate characters replaced by the Unicode replacement character (U+FFFD)
+    """
+    if text == None:
+        return None
+    if not isinstance(text, str): # paranoia
+        text = str(text)
+    try:
+        # Try encoding to UTF-8 to check if there are any issues
+        text.encode('utf-8')
+        return text
+    except UnicodeEncodeError:
+        # If encoding fails, replace surrogates with replacement character
+        # This handles surrogates that can't be encoded
+        return text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+
 def toNumber(value: str|int|None) -> int:
     """Convert string to number. handling units like g, m, k, (also mb kb gb though these should be avoided)"""
     if value is None:
@@ -106,7 +130,7 @@ def serialize_for_span(value: Any) -> Any:
     """
     Serialize a value for span attributes.
     OpenTelemetry only accepts primitives (bool, str, bytes, int, float) or sequences of those.
-    Complex types (dicts, lists, objects) are converted to JSON strings.
+    Complex types (dicts, objects) are converted to JSON strings.
     
     Handles objects by attempting to convert them to dicts, with safeguards against:
     - Circular references
@@ -119,14 +143,17 @@ def serialize_for_span(value: Any) -> Any:
     
     # For sequences, check if all elements are primitives
     if isinstance(value, (list, tuple)):
-        # If all elements are primitives, return as list
-        if all(isinstance(item, (str, int, float, bool, bytes, type(None))) for item in value):
-            return list(value)
-        # Otherwise serialize to JSON string
-        try:
-            return safe_json_dumps(value)
-        except Exception:
-            return str(value)
+        # Use short-circuiting loop instead of all() for better performance on large lists
+        # Only iterate until we find a non-primitive
+        for item in value:
+            if not isinstance(item, (str, int, float, bool, bytes, type(None))):
+                # Found non-primitive, serialize to JSON string
+                try:
+                    return safe_json_dumps(value)
+                except Exception:
+                    return str(value)
+        # All elements are primitives, return as list
+        return list(value)
     
     # For dicts and other complex types, serialize to JSON string
     try:
@@ -141,10 +168,13 @@ def safe_str_repr(value: Any) -> str:
     Safely convert a value to string representation.
     Handles objects with __repr__ that might raise exceptions.
     Uses AIQA_MAX_OBJECT_STR_CHARS environment variable (default: 100000) to limit length.
+    Also sanitizes surrogate characters to prevent UTF-8 encoding errors.
     """
     try:
         # Try __repr__ first (usually more informative)
         repr_str = repr(value)
+        # Sanitize surrogate characters that can't be encoded to UTF-8
+        repr_str = sanitize_string_for_utf8(repr_str)
         # Limit length to avoid huge strings
         if len(repr_str) > AIQA_MAX_OBJECT_STR_CHARS:
             return repr_str[:AIQA_MAX_OBJECT_STR_CHARS] + "... (truncated)"
