@@ -57,35 +57,13 @@ class AIQASpanExporter(SpanExporter):
         self.max_batch_size_bytes = max_batch_size_bytes
         
         # Get max_buffer_spans from parameter, environment variable, or default
-        if max_buffer_spans is None:
-            env_max_buffer = os.getenv("AIQA_MAX_BUFFER_SPANS")
-            if env_max_buffer:
-                try:
-                    max_buffer_spans = int(env_max_buffer)
-                    if max_buffer_spans < 1:
-                        logger.warning(f"Invalid AIQA_MAX_BUFFER_SPANS value '{env_max_buffer}' (must be >= 1), using default 10000")
-                        max_buffer_spans = 10000
-                except ValueError:
-                    logger.warning(f"Invalid AIQA_MAX_BUFFER_SPANS value '{env_max_buffer}', using default 10000")
-                    max_buffer_spans = 10000
-            else:
-                max_buffer_spans = 10000  # Default
+        if not max_buffer_spans:
+            max_buffer_spans = toNumber(os.getenv("AIQA_MAX_BUFFER_SPANS")) or 10000
         self.max_buffer_spans = max_buffer_spans
         
         # Get max_buffer_size_bytes from parameter, environment variable, or default
-        if max_buffer_size_bytes is None:
-            env_max_size = os.getenv("AIQA_MAX_BUFFER_SIZE_BYTES")
-            if env_max_size:
-                try:
-                    max_buffer_size_bytes = toNumber(env_max_size)
-                    if max_buffer_size_bytes < 1:
-                        logger.warning(f"Invalid AIQA_MAX_BUFFER_SIZE_BYTES value '{env_max_size}' (must be >= 1), using None (no limit)")
-                        max_buffer_size_bytes = None
-                except (ValueError, TypeError):
-                    logger.warning(f"Invalid AIQA_MAX_BUFFER_SIZE_BYTES value '{env_max_size}', using None (no limit)")
-                    max_buffer_size_bytes = None
-            else:
-                max_buffer_size_bytes = None  # Default: no limit
+        if not max_buffer_size_bytes:
+            max_buffer_size_bytes = toNumber(os.getenv("AIQA_MAX_BUFFER_SIZE_BYTES")) or toNumber("100m")
         self.max_buffer_size_bytes = max_buffer_size_bytes
         
         # Get startup delay from parameter or environment variable (default: 10s)
@@ -105,7 +83,9 @@ class AIQASpanExporter(SpanExporter):
         self.buffer_span_keys: set = set()  # Track (traceId, spanId) tuples to prevent duplicates (Python 3.8 compatible)
         self.buffer_size_bytes: int = 0  # Track total size of buffered spans in bytes
         # Cache span sizes to avoid recalculation (maps span_key -> size_bytes)
+        # Limited to max_buffer_spans * 2 to prevent unbounded growth
         self._span_size_cache: Dict[tuple, int] = {}
+        self._max_cache_size = self.max_buffer_spans * 2  # Allow cache to be 2x buffer size
         self.buffer_lock = threading.Lock()
         self.flush_lock = threading.Lock()
         # shutdown_requested is only set once (in shutdown()) and read many times
@@ -154,23 +134,33 @@ class AIQASpanExporter(SpanExporter):
             duplicates_count = 0
             dropped_count = 0
             dropped_memory_count = 0
+            flush_in_progress = self.flush_lock.locked()
+            
             for span in spans:
                 # Check if buffer is full by span count (prevent unbounded growth)
                 if len(self.buffer) >= self.max_buffer_spans:
-                    dropped_count += 1
-                    continue
+                    if flush_in_progress:
+                        # Flush in progress, drop this span
+                        dropped_count += 1
+                        continue
+                    # Flush not in progress, will trigger flush after adding spans
+                    # Continue processing remaining spans to add them before flush
                 
                 serialized = self._serialize_span(span)
                 span_key = (serialized["traceId"], serialized["spanId"])
                 if span_key not in self.buffer_span_keys:
-                    # Estimate size of this span when serialized
-                    span_json = json.dumps(serialized)
-                    span_size = len(span_json.encode('utf-8'))
+                    # Estimate size of this span when serialized (cache for later use)
+                    span_size = self._get_span_size(span_key, serialized)
                     
                     # Check if buffer is full by memory size (prevent unbounded memory growth)
                     if self.max_buffer_size_bytes is not None and self.buffer_size_bytes + span_size > self.max_buffer_size_bytes:
-                        dropped_memory_count += 1
-                        continue
+                        if flush_in_progress:
+                            # Flush in progress, drop this span
+                            # Don't cache size for dropped spans to prevent memory leak
+                            dropped_memory_count += 1
+                            continue
+                        # Flush not in progress, will trigger flush after adding spans
+                        # Continue processing remaining spans to add them before flush
                     
                     serialized_spans.append(serialized)
                     serialized_sizes.append(span_size)
@@ -184,15 +174,23 @@ class AIQASpanExporter(SpanExporter):
             self.buffer_size_bytes += sum(serialized_sizes)
             buffer_size = len(self.buffer)
             
+            # Check if thresholds are reached after adding spans
+            threshold_reached = self._check_thresholds_reached()
+            
             if dropped_count > 0:
-                logger.warning(f"WARNING: Buffer full ({buffer_size} spans), dropped {dropped_count} span(s). "
+                logger.warning(f"WARNING: Buffer full ({buffer_size} spans), dropped {dropped_count} span(s) (flush in progress). "
                     f"Consider increasing max_buffer_spans or fixing server connectivity."
                 )
             if dropped_memory_count > 0:
                 logger.warning(f"WARNING: Buffer memory limit reached ({self.buffer_size_bytes} bytes / {self.max_buffer_size_bytes} bytes), "
-                    f"dropped {dropped_memory_count} span(s). "
+                    f"dropped {dropped_memory_count} span(s) (flush in progress). "
                     f"Consider increasing AIQA_MAX_BUFFER_SIZE_BYTES or fixing server connectivity."
                 )
+        
+        # Trigger immediate flush if threshold reached and flush not in progress
+        if threshold_reached and not flush_in_progress:
+            logger.info(f"Buffer threshold reached ({buffer_size} spans, {self.buffer_size_bytes} bytes), triggering immediate flush")
+            self._trigger_immediate_flush()
         
         if duplicates_count > 0:
             logger.debug(f"export() added {len(serialized_spans)} span(s) to buffer, skipped {duplicates_count} duplicate(s). "
@@ -281,6 +279,29 @@ class AIQASpanExporter(SpanExporter):
         nanos = int(nanoseconds % 1_000_000_000)
         return (seconds, nanos)
 
+    def _get_span_size(self, span_key: tuple, serialized: Dict[str, Any]) -> int:
+        """
+        Get span size from cache or calculate and cache it.
+        Thread-safe when called within buffer_lock.
+        Limits cache size to prevent unbounded memory growth.
+        """
+        if span_key in self._span_size_cache:
+            return self._span_size_cache[span_key]
+        span_json = json.dumps(serialized)
+        span_size = len(span_json.encode('utf-8'))
+        # Only cache if we have valid keys and cache isn't too large
+        if span_key[0] and span_key[1] and len(self._span_size_cache) < self._max_cache_size:
+            self._span_size_cache[span_key] = span_size
+        return span_size
+
+    def _check_thresholds_reached(self) -> bool:
+        """Check if buffer thresholds are reached. Must be called within buffer_lock."""
+        if len(self.buffer) >= self.max_buffer_spans:
+            return True
+        if self.max_buffer_size_bytes is not None and self.buffer_size_bytes >= self.max_buffer_size_bytes:
+            return True
+        return False
+
     def _build_request_headers(self) -> Dict[str, str]:
         """Build HTTP headers for span requests."""
         return build_headers(self._api_key)
@@ -328,15 +349,18 @@ class AIQASpanExporter(SpanExporter):
         """
         Prepend spans back to buffer (thread-safe). Used to restore spans
         if sending fails. Rebuilds the span keys tracking set and buffer size.
+        Uses cached sizes when available to avoid re-serialization.
         """
         with self.buffer_lock:
             self.buffer[:0] = spans
             # Rebuild span keys set from current buffer contents
             self.buffer_span_keys = {(span["traceId"], span["spanId"]) for span in self.buffer}
-            # Recalculate buffer size
-            self.buffer_size_bytes = sum(
-                len(json.dumps(span).encode('utf-8')) for span in self.buffer
-            )
+            # Recalculate buffer size using cache when available
+            total_size = 0
+            for span in self.buffer:
+                span_key = (span.get("traceId"), span.get("spanId"))
+                total_size += self._get_span_size(span_key, span)
+            self.buffer_size_bytes = total_size
 
     def _clear_buffer(self) -> None:
         """Clear the buffer (thread-safe)."""
@@ -362,14 +386,7 @@ class AIQASpanExporter(SpanExporter):
         for span in spans:
             # Get size from cache if available, otherwise calculate it
             span_key = (span.get("traceId"), span.get("spanId"))
-            if span_key in self._span_size_cache:
-                span_size = self._span_size_cache[span_key]
-            else:
-                # Calculate size and cache it
-                span_json = json.dumps(span)
-                span_size = len(span_json.encode('utf-8'))
-                if span_key[0] and span_key[1]:  # Only cache if we have valid keys
-                    self._span_size_cache[span_key] = span_size
+            span_size = self._get_span_size(span_key, span)
             
             # Check if this single span exceeds the limit
             if span_size > self.max_batch_size_bytes:
@@ -479,6 +496,28 @@ class AIQASpanExporter(SpanExporter):
                 logger.error(f"Failed to start auto-flush thread: {e}", exc_info=True)
                 # Don't raise - allow spans to be buffered even if auto-flush fails
                 # They can still be flushed manually or on shutdown
+
+    def _trigger_immediate_flush(self) -> None:
+        """
+        Trigger an immediate flush in a background thread.
+        This is called when buffer thresholds are reached and no flush is in progress.
+        """
+        def flush_in_thread():
+            """Run flush in a new thread with its own event loop."""
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self.flush())
+                finally:
+                    if not loop.is_closed():
+                        loop.close()
+            except Exception as e:
+                logger.error(f"Error in immediate flush thread: {e}", exc_info=True)
+        
+        # Start flush in background thread (daemon so it doesn't block shutdown)
+        flush_thread = threading.Thread(target=flush_in_thread, daemon=True, name="AIQA-ImmediateFlush")
+        flush_thread.start()
 
     def _flush_worker(self) -> None:
         """Worker function for auto-flush thread. Runs in a separate thread with its own event loop."""

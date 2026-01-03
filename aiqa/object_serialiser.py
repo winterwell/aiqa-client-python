@@ -10,6 +10,7 @@ import logging
 from .constants import LOG_TAG
 from datetime import datetime, date, time
 from typing import Any, Callable, Set
+from json.encoder import JSONEncoder
 
 logger = logging.getLogger(LOG_TAG)
 
@@ -189,7 +190,7 @@ def safe_str_repr(value: Any) -> str:
 
 def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_depth: int = 0) -> Any:
     """
-    Convert an object to a dictionary representation.
+    Convert an object to a dictionary representation. Applies data filters to the object.
     
     Args:
         obj: The object to convert
@@ -203,7 +204,7 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
     if current_depth > max_depth:
         return "<max depth exceeded>"
     
-    obj_id = id(obj)
+    obj_id = id(obj) # note: id cannot raise exception
     if obj_id in visited:
         return "<circular reference>"
     
@@ -216,53 +217,42 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
         return obj
     
     # Handle datetime objects
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    if isinstance(obj, date):
-        return obj.isoformat()
-    if isinstance(obj, time):
-        return obj.isoformat()
+    if isinstance(obj, datetime) or isinstance(obj, date) or isinstance(obj, time):
+        try:
+            return obj.isoformat()
+        except Exception: # paranoia if isoformat() fails (e.g., invalid datetime state, custom implementation bug)
+            return safe_str_repr(obj)
     
     # Handle dict
     if isinstance(obj, dict):
         visited.add(obj_id)
-        try:
-            result = {}
-            for k, v in obj.items():
-                try:
-                    key_str = str(k) if not isinstance(k, (str, int, float, bool)) else k
-                    filtered_value = _apply_data_filters(key_str, v)
-                    result[key_str] = object_to_dict(filtered_value, visited, max_depth, current_depth + 1)
-                except Exception as e:
-                    # If one key-value pair fails, log and use string representation for the value
-                    key_str = str(k) if not isinstance(k, (str, int, float, bool)) else k
-                    logger.debug(f"Failed to convert dict value for key '{key_str}': {e}")
-                    result[key_str] = safe_str_repr(v)
-            visited.remove(obj_id)
-            return result
-        except Exception as e:
-            visited.discard(obj_id)
-            logger.debug(f"Failed to convert dict to dict: {e}")
-            return safe_str_repr(obj)
+        result = {}
+        for k, v in obj.items():
+            try:
+                key_str = str(k) if not isinstance(k, (str, int, float, bool)) else k
+                filtered_value = _apply_data_filters(key_str, v)
+                result[key_str] = object_to_dict(filtered_value, visited, max_depth, current_depth + 1)
+            except Exception as e:
+                # If one key-value pair fails, log and use string representation for the value
+                key_str = str(k) if not isinstance(k, (str, int, float, bool)) else k
+                logger.debug(f"Failed to convert dict value for key '{key_str}': {e}")
+                result[key_str] = safe_str_repr(v)
+        visited.remove(obj_id)
+        return result
     
     # Handle list/tuple
     if isinstance(obj, (list, tuple)):
         visited.add(obj_id)
-        try:
-            result = []
-            for item in obj:
-                try:
-                    result.append(object_to_dict(item, visited, max_depth, current_depth + 1))
-                except Exception as e:
-                    # If one item fails, log and use its string representation
-                    logger.debug(f"Failed to convert list item {type(item).__name__} to dict: {e}")
-                    result.append(safe_str_repr(item))
-            visited.remove(obj_id)
-            return result
-        except Exception as e:
-            visited.discard(obj_id)
-            logger.debug(f"Failed to convert list/tuple to dict: {e}")
-            return safe_str_repr(obj)
+        result = []
+        for item in obj:
+            try:
+                result.append(object_to_dict(item, visited, max_depth, current_depth + 1))
+            except Exception as e:
+                # If one item fails, log and use its string representation
+                logger.debug(f"Failed to convert list item {type(item).__name__} to dict: {e}")
+                result.append(safe_str_repr(item))
+        visited.remove(obj_id)
+        return result
     
     # Handle dataclasses
     if dataclasses.is_dataclass(obj):
@@ -289,18 +279,11 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
     if hasattr(obj, "__dict__"):
         visited.add(obj_id)
         try:
-            result = {}
-            for key, value in obj.__dict__.items():
-                # Skip private attributes that start with __
-                if not (isinstance(key, str) and key.startswith("__")):
-                    filtered_value = _apply_data_filters(key, value)
-                    result[key] = object_to_dict(filtered_value, visited, max_depth, current_depth + 1)
-            visited.remove(obj_id)
-            return result
-        except Exception as e:
+            obj_dict = obj.__dict__
+            return object_to_dict(obj_dict, visited, max_depth, current_depth) # Note: Don't count using __dict__ as a recursion depth +1 step
+        except Exception as e: # paranoia: object_to_dict should never raise an exception
             visited.discard(obj_id)
-            # Log the error for debugging, but still return string representation
-            logger.debug(f"Failed to convert object {type(obj).__name__} to dict: {e}")
+            logger.debug(f"Failed to convert object {type(obj).__name__} with __dict__ to dict: {e}")
             return safe_str_repr(obj)
     
     # Handle objects with __slots__
@@ -342,6 +325,36 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
     return safe_str_repr(obj)
 
 
+class SizeLimitedJSONEncoder(JSONEncoder):
+    """
+    Custom JSON encoder that stops serialization early when max_size_chars is reached.
+    Tracks output length incrementally and stops yielding chunks when limit is exceeded.
+    """
+    def __init__(self, max_size_chars: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_size_chars = max_size_chars
+        self.current_length = 0
+        self._truncated = False
+    
+    def iterencode(self, o, _one_shot=False):
+        """
+        Encode the object incrementally, checking size after each chunk.
+        Stops early if max_size_chars is exceeded.
+        """
+        self.current_length = 0
+        self._truncated = False
+        
+        # Use _one_shot optimization when possible (faster for simple objects)
+        # The parent class will determine if _one_shot is safe
+        for chunk in super().iterencode(o, _one_shot):
+            self.current_length += len(chunk)
+            if self.current_length > self.max_size_chars:
+                self._truncated = True
+                # Stop yielding chunks when limit is exceeded
+                break
+            yield chunk
+
+
 def safe_json_dumps(value: Any) -> str:
     """
     Safely serialize a value to JSON string with safeguards against:
@@ -360,68 +373,45 @@ def safe_json_dumps(value: Any) -> str:
     max_size_chars = AIQA_MAX_OBJECT_STR_CHARS
     visited: Set[int] = set()
     
-    # Convert the entire structure to ensure circular references are detected
+    # Convert the entire structure to json-friendy form, and ensure circular references are detected
     # across the whole object graph
     try:
         converted = object_to_dict(value, visited)
     except Exception as e:
-        # If conversion fails, try with a fresh visited set and json default handler
-        logger.debug(f"object_to_dict failed for {type(value).__name__}, trying json.dumps with default handler: {e}")
-        try:
-            json_str = json.dumps(value, default=json_default_handler_factory(set()))
-            if len(json_str) > max_size_chars:
-                return f"<object {type(value)} too large: {len(json_str)} chars (limit: {max_size_chars} chars) begins: {json_str[:100]}... conversion error: {e}>"
-            return json_str
-        except Exception as e2:
-            logger.debug(f"json.dumps with default handler also failed for {type(value).__name__}: {e2}")
-            return safe_str_repr(value)
+        # Note: object_to_dict is very defensive but can still raise in rare edge cases:
+        # - Objects with corrupted type metadata causing isinstance()/hasattr() to fail
+        # - Malformed dataclasses causing dataclasses.fields() to raise
+        # - Objects where accessing __dict__ or __slots__ triggers descriptors that raise
+        logger.debug(f"object_to_dict failed for {type(value).__name__}, using safe_str_repr. Error: {e}")
+        return safe_str_repr(value)
     
-    # Try JSON serialization of the converted structure
+    # Try JSON serialization of the converted structure with size-limited encoder
+    # After object_to_dict(), converted is a plain dict/list with circular refs already
+    # converted to "<circular reference>" strings. We use check_circular=True (default)
+    # as an additional safety net, though it's redundant since object_to_dict() already
+    # handled circular refs. We don't need a default handler here since converted
+    # should be JSON-serializable.
     try:
-        json_str = json.dumps(converted, default=json_default_handler_factory(set()))
-        # Check size
-        if len(json_str) > max_size_chars:
+        encoder = SizeLimitedJSONEncoder(
+            max_size_chars=max_size_chars,
+            check_circular=True,  # Safety net for dict/list circular refs (redundant but harmless)
+            ensure_ascii=False
+        )
+        # Use iterencode to get chunks and check size incrementally
+        chunks = []
+        for chunk in encoder.iterencode(converted, _one_shot=True):
+            chunks.append(chunk)
+            if encoder._truncated:
+                # Hit the limit, stop early
+                json_str = ''.join(chunks)
+                return f"<object {type(value)} too large: {len(json_str)} chars (limit: {max_size_chars} chars) begins: {json_str[:100]}...>"
+        json_str = ''.join(chunks)
+        # Check if truncation occurred (encoder may have stopped after last chunk)
+        if encoder._truncated or len(json_str) > max_size_chars:
             return f"<object {type(value)} too large: {len(json_str)} chars (limit: {max_size_chars} chars) begins: {json_str[:100]}...>"
         return json_str
     except Exception as e:
-        logger.debug(f"json.dumps total fail for {type(value).__name__}: {e2}")
+        logger.debug(f"json.dumps total fail for {type(value).__name__}: {e}")
         # Final fallback
         return safe_str_repr(value)
-
-
-def json_default_handler_factory(visited: Set[int]) -> Callable[[Any], Any]:
-    """
-    Create a JSON default handler with a shared visited set for circular reference detection.
-    """
-    def handler(obj: Any) -> Any:
-        # Handle datetime objects
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        if isinstance(obj, date):
-            return obj.isoformat()
-        if isinstance(obj, time):
-            return obj.isoformat()
-        
-        # Handle bytes
-        if isinstance(obj, bytes):
-            try:
-                return obj.decode('utf-8')
-            except UnicodeDecodeError:
-                return f"<bytes: {len(obj)} bytes>"
-        
-        # Try object conversion with the shared visited set
-        try:
-            return object_to_dict(obj, visited)
-        except Exception:
-            return safe_str_repr(obj)
-    
-    return handler
-
-
-def json_default_handler(obj: Any) -> Any:
-    """
-    Default handler for JSON serialization of non-serializable objects.
-    This is a fallback that creates its own visited set.
-    """
-    return json_default_handler_factory(set())(obj)
 

@@ -19,6 +19,7 @@ from .client import get_aiqa_client, get_component_tag, set_component_tag as _se
 from .constants import AIQA_TRACER_NAME, LOG_TAG
 from .object_serialiser import serialize_for_span
 from .http_utils import build_headers, get_server_url, get_api_key
+from .tracing_llm_utils import _extract_and_set_token_usage, _extract_and_set_provider_and_model
 
 logger = logging.getLogger(LOG_TAG)
 
@@ -116,34 +117,12 @@ class TracingOptions:
         self.filter_output = filter_output
 
 
-
-def _shallow_copy_for_filtering(value: Any) -> Any:
-    """
-    Shallow copy mutable structures needed for safe filtering (to avoid mutating originals).
-    Only copies what's necessary for filtering - full serialization happens immediately after.
-    
-    Args:
-        value: The value to shallow copy
-        
-    Returns:
-        A shallow copy of mutable structures, or the original value for immutable types
-    """
-    # Immutable types: return as-is
-    if value is None or isinstance(value, (str, int, float, bool, bytes, type)):
-        return value
-    
-    # For dicts and lists, shallow copy is sufficient for filtering
-    if isinstance(value, dict):
-        return value.copy()  # Shallow copy - nested structures will be serialized anyway
-    if isinstance(value, (list, tuple)):
-        return list(value) if isinstance(value, list) else tuple(value)  # Shallow copy
-    
-    # For other types, return as-is (they'll be serialized immediately)
-    return value
-
-
 def _prepare_input(args: tuple, kwargs: dict) -> Any:
-    """Prepare input for span attributes.
+    """Prepare input for span attributes. 
+    Aims to produce nice span attributes for the input, since {args, kwargs} is not a natural way to read function input. 
+    So can "unwrap" the args, kwargs.
+    
+    For single-arg-dicts or kwargs-only, returns a shallow copy of the input data.
     
     Note: This function does NOT serialize values - it just structures the data.
     Serialization happens later via serialize_for_span() to avoid double-encoding
@@ -151,16 +130,18 @@ def _prepare_input(args: tuple, kwargs: dict) -> Any:
     """
     if not args and not kwargs:
         return None
-    if len(args) == 1 and not kwargs:
-        return args[0]  # Don't serialize here - will be serialized later
-    if kwargs and not args:
-        return kwargs
-    # Multiple args or kwargs - combine into dict
-    result = {}
-    if args:
-        result["args"] = list(args)  # Keep as-is, will be serialized later
-    if kwargs:
-        result["kwargs"] = dict(kwargs)  # Keep as-is, will be serialized later
+    if not kwargs:
+        if len(args) == 1:
+            arg0 = args[0]
+            if isinstance(arg0, dict): # shallow copy to protect against mutating the input
+                return arg0.copy()
+            return arg0
+        return list(args)
+    if kwargs and len(args) == 0:
+        return kwargs.copy() # shallow copy to protect against mutating the input
+    # Multiple args and kwargs - combine into dict
+    result = kwargs.copy()
+    result["args"] = list(args)
     return result
 
 
@@ -171,8 +152,8 @@ def _prepare_and_filter_input(
     ignore_input: Optional[List[str]],
 ) -> Any:
     """
-    Prepare and filter input for span attributes.
-    Copies mutable structures to avoid shared mutations affecting traces.
+    Prepare and filter input for span attributes - applies the user's filter_input and ignore_input.
+    For single-arg-dicts or kwargs-only, returns a shallow copy of the input data.
     """
     # Handle "self" in ignore_input by skipping the first argument
     filtered_args = args
@@ -187,14 +168,17 @@ def _prepare_and_filter_input(
         # Also remove "self" from kwargs if present
         if "self" in filtered_kwargs:
             del filtered_kwargs["self"]
-    
+    # turn args, kwargs into one "nice" object
     input_data = _prepare_input(filtered_args, filtered_kwargs)
-    if filter_input:
+    if filter_input and input_data is not None:
         input_data = filter_input(input_data)
-    if filtered_ignore_input and isinstance(input_data, dict):
-        for key in filtered_ignore_input:
-            if key in input_data:
-                del input_data[key]
+    if filtered_ignore_input and len(filtered_ignore_input) > 0:
+        if not isinstance(input_data, dict):
+            logger.warning(f"_prepare_and_filter_input: skip: ignore_input is set beyond 'self': {filtered_ignore_input} but input_data is not a dict: {type(input_data)}")
+        else:
+            for key in filtered_ignore_input:
+                if key in input_data:
+                    del input_data[key]
     # Also handle case where input_data is just self (single value, not dict)
     # If we filtered out self and there are no remaining args/kwargs, return None
     if ignore_input and "self" in ignore_input and not filtered_args and not filtered_kwargs:
@@ -202,14 +186,16 @@ def _prepare_and_filter_input(
     return input_data
 
 
-def _prepare_and_filter_output(
+def _filter_and_serialize_output(
     result: Any,
     filter_output: Optional[Callable[[Any], Any]],
     ignore_output: Optional[List[str]],
 ) -> Any:
-    """Prepare and filter output for span attributes."""
+    """Filter and serialize output for span attributes."""
     output_data = result
     if filter_output:
+        if isinstance(output_data, dict):
+            output_data = output_data.copy() # copy to provide shallow protection against the user accidentally mutating the output with filter_output
         output_data = filter_output(output_data)
     if ignore_output and isinstance(output_data, dict):
         output_data = output_data.copy()
@@ -228,190 +214,6 @@ def _handle_span_exception(span: trace.Span, exception: Exception) -> None:
     span.record_exception(error)
     span.set_status(Status(StatusCode.ERROR, str(error)))
 
-
-def _is_attribute_set(span: trace.Span, attribute_name: str) -> bool:
-    """
-    Check if an attribute is already set on a span.
-    Returns True if the attribute exists, False otherwise.
-    Safe against exceptions.
-    """
-    try:
-        # Try multiple ways to access span attributes (SDK spans may store them differently)
-        # Check public 'attributes' property
-        if hasattr(span, "attributes"):
-            attrs = span.attributes
-            if attrs and attribute_name in attrs:
-                return True
-        
-        # Check private '_attributes' (common in OpenTelemetry SDK)
-        if hasattr(span, "_attributes"):
-            attrs = span._attributes
-            if attrs and attribute_name in attrs:
-                return True
-        
-        # If we can't find the attribute, assume not set (conservative approach)
-        return False
-    except Exception:
-        # If anything goes wrong, assume not set (conservative approach)
-        return False
-
-
-def _extract_and_set_token_usage(span: trace.Span, result: Any) -> None:
-    """
-    Extract OpenAI API style token usage from result and add to span attributes
-    using OpenTelemetry semantic conventions for gen_ai.
-    
-    Looks for usage dict with prompt_tokens, completion_tokens, and total_tokens.
-    Sets gen_ai.usage.input_tokens, gen_ai.usage.output_tokens, and gen_ai.usage.total_tokens.
-    Only sets attributes that are not already set.
-    
-    This function detects token usage from OpenAI API response patterns:
-    - OpenAI Chat Completions API: The 'usage' object contains 'prompt_tokens', 'completion_tokens', and 'total_tokens'.
-      See https://platform.openai.com/docs/api-reference/chat/object (usage field)
-    - OpenAI Completions API: The 'usage' object contains 'prompt_tokens', 'completion_tokens', and 'total_tokens'.
-      See https://platform.openai.com/docs/api-reference/completions/object (usage field)
-    
-    This function is safe against exceptions and will not derail tracing or program execution.
-    """
-    try:
-        if not span.is_recording():
-            return
-        
-        usage = None
-        
-        # Check if result is a dict with 'usage' key
-        try:
-            if isinstance(result, dict):
-                usage = result.get("usage")
-                # Also check if result itself is a usage dict (OpenAI format)
-                if usage is None and all(key in result for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
-                    usage = result
-                # Also check if result itself is a usage dict (Bedrock format)
-                elif usage is None and all(key in result for key in ("input_tokens", "output_tokens")):
-                    usage = result
-            
-            # Check if result has a 'usage' attribute (e.g., OpenAI response object)
-            elif hasattr(result, "usage"):
-                usage = result.usage
-        except Exception:
-            # If accessing result properties fails, just return silently
-            return
-        
-        # Extract token usage if found
-        if isinstance(usage, dict):
-            try:
-                # Support both OpenAI format (prompt_tokens/completion_tokens) and Bedrock format (input_tokens/output_tokens)
-                prompt_tokens = usage.get("prompt_tokens") or usage.get("PromptTokens")
-                completion_tokens = usage.get("completion_tokens") or usage.get("CompletionTokens")
-                input_tokens = usage.get("input_tokens") or usage.get("InputTokens")
-                output_tokens = usage.get("output_tokens") or usage.get("OutputTokens")
-                total_tokens = usage.get("total_tokens") or usage.get("TotalTokens")
-                
-                # Use Bedrock format if OpenAI format not available
-                if prompt_tokens is None:
-                    prompt_tokens = input_tokens
-                if completion_tokens is None:
-                    completion_tokens = output_tokens
-                
-                # Calculate total_tokens if not provided but we have input and output
-                if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
-                    total_tokens = prompt_tokens + completion_tokens
-                
-                # Only set attributes that are not already set
-                if prompt_tokens is not None and not _is_attribute_set(span, "gen_ai.usage.input_tokens"):
-                    span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
-                if completion_tokens is not None and not _is_attribute_set(span, "gen_ai.usage.output_tokens"):
-                    span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
-                if total_tokens is not None and not _is_attribute_set(span, "gen_ai.usage.total_tokens"):
-                    span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
-            except Exception:
-                # If setting attributes fails, log but don't raise
-                logger.debug(f"Failed to set token usage attributes on span")
-    except Exception:
-        # Catch any other exceptions to ensure this never derails tracing
-        logger.debug(f"Error in _extract_and_set_token_usage")
-
-
-def _extract_and_set_provider_and_model(span: trace.Span, result: Any) -> None:
-    """
-    Extract provider and model information from result and add to span attributes
-    using OpenTelemetry semantic conventions for gen_ai.
-    
-    Looks for 'model', 'provider', 'provider_name' fields in the result.
-    Sets gen_ai.provider.name and gen_ai.request.model.
-    Only sets attributes that are not already set.
-    
-    This function detects model information from common API response patterns:
-    - OpenAI Chat Completions API: The 'model' field is at the top level of the response.
-      See https://platform.openai.com/docs/api-reference/chat/object
-    - OpenAI Completions API: The 'model' field is at the top level of the response.
-      See https://platform.openai.com/docs/api-reference/completions/object
-    
-    This function is safe against exceptions and will not derail tracing or program execution.
-    """
-    try:
-        if not span.is_recording():
-            return
-        
-        model = None
-        provider = None
-        
-        # Check if result is a dict
-        try:
-            if isinstance(result, dict):
-                model = result.get("model") or result.get("Model")
-                provider = result.get("provider") or result.get("Provider") or result.get("provider_name") or result.get("providerName")
-            
-            # Check if result has attributes (e.g., OpenAI response object)
-            elif hasattr(result, "model"):
-                model = result.model
-            if hasattr(result, "provider"):
-                provider = result.provider
-            elif hasattr(result, "provider_name"):
-                provider = result.provider_name
-            elif hasattr(result, "providerName"):
-                provider = result.providerName
-            
-            # Check nested structures (e.g., response.data.model)
-            if model is None and hasattr(result, "data"):
-                data = result.data
-                if isinstance(data, dict):
-                    model = data.get("model") or data.get("Model")
-                elif hasattr(data, "model"):
-                    model = data.model
-            
-            # Check for model in choices (OpenAI pattern)
-            if model is None and isinstance(result, dict):
-                choices = result.get("choices")
-                if choices and isinstance(choices, list) and len(choices) > 0:
-                    first_choice = choices[0]
-                    if isinstance(first_choice, dict):
-                        model = first_choice.get("model")
-                    elif hasattr(first_choice, "model"):
-                        model = first_choice.model
-        except Exception:
-            # If accessing result properties fails, just return silently
-            return
-        
-        # Set attributes if found and not already set
-        try:
-            if model is not None and not _is_attribute_set(span, "gen_ai.request.model"):
-                # Convert to string if needed
-                model_str = str(model) if model is not None else None
-                if model_str:
-                    span.set_attribute("gen_ai.request.model", model_str)
-            
-            if provider is not None and not _is_attribute_set(span, "gen_ai.provider.name"):
-                # Convert to string if needed
-                provider_str = str(provider) if provider is not None else None
-                if provider_str:
-                    span.set_attribute("gen_ai.provider.name", provider_str)
-        except Exception:
-            # If setting attributes fails, log but don't raise
-            logger.debug(f"Failed to set provider/model attributes on span")
-    except Exception:
-        # Catch any other exceptions to ensure this never derails tracing
-        logger.debug(f"Error in _extract_and_set_provider_and_model")
 
 
 def _finalize_span_success_common(
@@ -440,7 +242,7 @@ def _finalize_span_success_common(
     _extract_and_set_provider_and_model(span, result_for_metadata)
     
     # Prepare, filter, and serialize output (serialization happens in _prepare_and_filter_output)
-    output_data = _prepare_and_filter_output(output_data, filter_output, ignore_output)
+    output_data = _filter_and_serialize_output(output_data, filter_output, ignore_output)
     if output_data is not None:
         # output_data is already serialized (immutable) from _prepare_and_filter_output
         span.set_attribute("output", output_data)
@@ -686,19 +488,19 @@ def WithTracing(
             )
         
         def _execute_with_span_sync(executor: Callable[[], Any], input_data: Any) -> Any:
-            """Execute sync function within span context, handling input/output and exceptions."""
+            """Execute sync function within span context, handling input/output and exceptions.
+            Note: input_data has already gone through _prepare_and_filter_input
+            """
             # Ensure tracer provider is initialized before creating spans
             # This is called lazily when the function runs, not at decorator definition time
             client = get_aiqa_client()
             if not client.enabled:
                 return executor()
-            
             # Get tracer after initialization (lazy)
             tracer = get_aiqa_tracer()
             with tracer.start_as_current_span(fn_name) as span:
                 if not _setup_span(span, input_data):
-                    return executor()
-                
+                    return executor() # span is not recording, so just execute the function and return the result                
                 try:
                     result = executor()
                     _finalize_span_success(span, result)
@@ -748,7 +550,7 @@ def WithTracing(
             
             try:
                 if not _setup_span(span, input_data):
-                    generator = executor()
+                    generator = executor() # span is not recording, so just execute the function and return the result
                     trace.context_api.detach(token)
                     span.end()
                     return generator
