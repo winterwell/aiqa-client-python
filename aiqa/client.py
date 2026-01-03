@@ -7,7 +7,9 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-logger = logging.getLogger("AIQA")
+from .constants import AIQA_TRACER_NAME, LOG_TAG
+
+logger = logging.getLogger(LOG_TAG)
 
 # Compatibility import for TraceIdRatioBased sampler
 # In older OpenTelemetry versions it was TraceIdRatioBasedSampler
@@ -20,7 +22,7 @@ except ImportError:
         from opentelemetry.sdk.trace.sampling import TraceIdRatioBasedSampler as TraceIdRatioBased
     except ImportError:
         logger.warning(
-            "Could not import TraceIdRatioBased or TraceIdRatioBasedSampler from "
+            f"Could not import TraceIdRatioBased or TraceIdRatioBasedSampler from "
             "opentelemetry.sdk.trace.sampling. AIQA tracing may not work correctly. "
             "Please ensure opentelemetry-sdk>=1.24.0 is installed. "
             "Try: pip install --upgrade opentelemetry-sdk"
@@ -28,7 +30,7 @@ except ImportError:
         # Set to None so we can check later
         TraceIdRatioBased = None
 
-from .constants import AIQA_TRACER_NAME
+from .http_utils import get_server_url, get_api_key
 
 class AIQAClient:
     """
@@ -93,7 +95,7 @@ class AIQAClient:
         This will also set enabled=False to prevent further tracing attempts.
         """
         try:
-            logger.info("AIQA tracing shutting down")
+            logger.info(f"AIQA tracing shutting down")
             # Disable tracing to prevent attempts to use shut-down system
             self.enabled = False
             if self._provider:
@@ -150,7 +152,7 @@ def get_aiqa_client() -> AIQAClient:
         # Optional: Initialize explicitly (usually not needed)
         client = get_aiqa_client()
         if client.enabled:
-            print("Tracing is enabled")
+            print(f"Tracing is enabled")
         
         @WithTracing
         def my_function():
@@ -161,7 +163,7 @@ def get_aiqa_client() -> AIQAClient:
         _init_tracing()
     except Exception as e:
         logger.error(f"Failed to initialize AIQA tracing: {e}")
-        logger.warning("AIQA tracing is disabled. Your application will continue to run without tracing.")
+        logger.warning(f"AIQA tracing is disabled. Your application will continue to run without tracing.")
     return client
 
 def _init_tracing() -> None:
@@ -171,8 +173,8 @@ def _init_tracing() -> None:
         return
     
     try:
-        server_url = os.getenv("AIQA_SERVER_URL")
-        api_key = os.getenv("AIQA_API_KEY")
+        server_url = get_server_url()
+        api_key = get_api_key()
         
         if not server_url or not api_key:
             client.enabled = False
@@ -231,7 +233,7 @@ def _attach_aiqa_processor(provider: TracerProvider) -> None:
         # Check if already attached
         for p in provider._active_span_processor._span_processors:
             if isinstance(getattr(p, "exporter", None), AIQASpanExporter):
-                logger.debug("AIQA span processor already attached, skipping")
+                logger.debug(f"AIQA span processor already attached, skipping")
                 return
 
         exporter = AIQASpanExporter(
@@ -241,7 +243,7 @@ def _attach_aiqa_processor(provider: TracerProvider) -> None:
         provider.add_span_processor(BatchSpanProcessor(exporter))
         global client
         client.exporter = exporter
-        logger.debug("AIQA span processor attached successfully")
+        logger.debug(f"AIQA span processor attached successfully")
     except Exception as e:
         logger.error(f"Error attaching AIQA span processor: {e}")
         # Re-raise to let _init_tracing handle it - it will log and continue

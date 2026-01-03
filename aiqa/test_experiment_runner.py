@@ -54,7 +54,7 @@ async def example_basic_usage():
     Basic example of using ExperimentRunner.
     """
     if not os.getenv("AIQA_API_KEY"):
-        print("Warning: AIQA_API_KEY environment variable is not set. Example may fail.")
+        print(f"Warning: AIQA_API_KEY environment variable is not set. Example may fail.")
 
     dataset_id = "your-dataset-id-here"
     organisation_id = "your-organisation-id-here"
@@ -171,6 +171,6 @@ if __name__ == "__main__":
     # asyncio.run(example_basic_usage())
     # asyncio.run(example_with_experiment_setup())
     # asyncio.run(example_stepwise())
-    print("Please uncomment one of the examples above to run it.")
-    print("Make sure to set your dataset_id and organisation_id in the example functions.")
+    print(f"Please uncomment one of the examples above to run it.")
+    print(f"Make sure to set your dataset_id and organisation_id in the example functions.")
 

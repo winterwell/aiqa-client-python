@@ -14,9 +14,10 @@ from typing import List, Dict, Any, Optional
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
-from .constants import AIQA_TRACER_NAME, VERSION
+from .constants import AIQA_TRACER_NAME, VERSION, LOG_TAG
+from .http_utils import get_server_url, get_api_key, build_headers
 
-logger = logging.getLogger("AIQA")
+logger = logging.getLogger(LOG_TAG)
 
 
 class AIQASpanExporter(SpanExporter):
@@ -45,8 +46,8 @@ class AIQASpanExporter(SpanExporter):
             max_buffer_spans: Maximum spans to buffer (prevents unbounded growth)
             startup_delay_seconds: Delay before starting auto-flush (default: 10s, or AIQA_STARTUP_DELAY_SECONDS env var)
         """
-        self._server_url = server_url
-        self._api_key = api_key
+        self._server_url = get_server_url(server_url)
+        self._api_key = get_api_key(api_key)
         self.flush_interval_ms = flush_interval_seconds * 1000
         self.max_batch_size_bytes = max_batch_size_bytes
         self.max_buffer_spans = max_buffer_spans
@@ -75,27 +76,19 @@ class AIQASpanExporter(SpanExporter):
         self._auto_flush_started = False
         self._auto_flush_lock = threading.Lock()  # Lock for lazy thread creation
         
-        logger.info(
-            f"Initializing AIQASpanExporter: server_url={self.server_url or 'not set'}, "
+        logger.info(f"Initializing AIQASpanExporter: server_url={self._server_url or 'not set'}, "
             f"flush_interval={flush_interval_seconds}s, startup_delay={startup_delay_seconds}s"
         )
         # Don't start thread immediately - start lazily on first export to avoid startup issues
-
-    @property
-    def server_url(self) -> str:         
-        return self._server_url or os.getenv("AIQA_SERVER_URL", "").rstrip("/")
-
-    @property
-    def api_key(self) -> str:
-        return self._api_key or os.getenv("AIQA_API_KEY", "")
 
     def export(self, spans: List[ReadableSpan]) -> SpanExportResult:
         """
         Export spans to the AIQA server. Adds spans to buffer for async flushing.
         Deduplicates spans based on (traceId, spanId) to prevent repeated exports.
+        Actual send is done by flush -> _send_spans, or shutdown -> _send_spans_sync
         """
         if not spans:
-            logger.debug("export() called with empty spans list")
+            logger.debug(f"export: called with empty spans list")
             return SpanExportResult.SUCCESS
         
         # Check if AIQA tracing is enabled
@@ -103,13 +96,13 @@ class AIQASpanExporter(SpanExporter):
             from .client import get_aiqa_client
             client = get_aiqa_client()
             if not client.enabled:
-                logger.debug(f"AIQA export() skipped: tracing is disabled")
+                logger.debug(f"AIQA export: skipped: tracing is disabled")
                 return SpanExportResult.SUCCESS
         except Exception:
             # If we can't check enabled status, proceed (fail open)
             pass
         
-        logger.debug(f"AIQA export() called with {len(spans)} spans")
+        logger.debug(f"AIQA export() to buffer called with {len(spans)} spans")
         
         # Lazy initialization: start auto-flush thread on first export
         # This avoids thread creation during initialization, which can cause issues in ECS deployments
@@ -133,25 +126,22 @@ class AIQASpanExporter(SpanExporter):
                     self.buffer_span_keys.add(span_key)
                 else:
                     duplicates_count += 1
-                    logger.debug(f"export() skipping duplicate span: traceId={serialized['traceId']}, spanId={serialized['spanId']}")
+                    logger.debug(f"export: skipping duplicate span: traceId={serialized['traceId']}, spanId={serialized['spanId']}")
             
             self.buffer.extend(serialized_spans)
             buffer_size = len(self.buffer)
             
             if dropped_count > 0:
-                logger.warning(
-                    f"WARNING: Buffer full ({buffer_size} spans), dropped {dropped_count} span(s). "
+                logger.warning(f"WARNING: Buffer full ({buffer_size} spans), dropped {dropped_count} span(s). "
                     f"Consider increasing max_buffer_spans or fixing server connectivity."
                 )
         
         if duplicates_count > 0:
-            logger.debug(
-                f"export() added {len(serialized_spans)} span(s) to buffer, skipped {duplicates_count} duplicate(s). "
+            logger.debug(f"export() added {len(serialized_spans)} span(s) to buffer, skipped {duplicates_count} duplicate(s). "
                 f"Total buffered: {buffer_size}"
             )
         else:
-            logger.debug(
-                f"export() added {len(spans)} span(s) to buffer. "
+            logger.debug(f"export() added {len(spans)} span(s) to buffer. "
                 f"Total buffered: {buffer_size}"
             )
 
@@ -235,16 +225,10 @@ class AIQASpanExporter(SpanExporter):
 
     def _build_request_headers(self) -> Dict[str, str]:
         """Build HTTP headers for span requests."""
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"ApiKey {self.api_key}"
-        return headers
+        return build_headers(self._api_key)
 
     def _get_span_url(self) -> str:
-        """Get the URL for sending spans."""
-        if not self.server_url:
-            raise ValueError("AIQA_SERVER_URL is not set. Cannot send spans to server.")
-        return f"{self.server_url}/span"
+        return f"{self._server_url}/span"
 
     def _is_interpreter_shutdown_error(self, error: Exception) -> bool:
         """Check if error is due to interpreter shutdown."""
@@ -323,8 +307,7 @@ class AIQASpanExporter(SpanExporter):
                 # Log warning about oversized span
                 span_name = span.get('name', 'unknown')
                 span_trace_id = span.get('traceId', 'unknown')
-                logger.warning(
-                    f"Span '{span_name}' (traceId={span_trace_id}) exceeds max_batch_size_bytes "
+                logger.warning(f"Span \'{span_name}' (traceId={span_trace_id}) exceeds max_batch_size_bytes "
                     f"({span_size} bytes > {self.max_batch_size_bytes} bytes). "
                     f"Will attempt to send it anyway - may fail if server/nginx limit is exceeded."
                 )
@@ -354,22 +337,21 @@ class AIQASpanExporter(SpanExporter):
         
         Lock ordering: flush_lock -> buffer_lock (must be consistent to avoid deadlocks)
         """
-        logger.debug("flush() called - attempting to acquire flush lock")
+        logger.debug(f"flush: called - attempting to acquire flush lock")
         with self.flush_lock:
-            logger.debug("flush() acquired flush lock")
+            logger.debug(f"flush() acquired flush lock")
             # Atomically extract and remove spans to prevent race conditions
             # where export() adds spans between extraction and clearing
             spans_to_flush = self._extract_and_remove_spans_from_buffer()
-            logger.debug(f"flush() extracted {len(spans_to_flush)} span(s) from buffer")
+            logger.debug(f"flush: extracted {len(spans_to_flush)} span(s) from buffer")
 
             if not spans_to_flush:
-                logger.debug("flush() completed: no spans to flush")
+                logger.debug(f"flush() completed: no spans to flush")
                 return
 
             # Skip sending if server URL is not configured
-            if not self.server_url:
-                logger.warning(
-                    f"Skipping flush: AIQA_SERVER_URL is not set. {len(spans_to_flush)} span(s) will not be sent."
+            if not self._server_url:
+                logger.warning(f"Skipping flush: AIQA_SERVER_URL is not set. {len(spans_to_flush)} span(s) will not be sent."
                 )
                 # Spans already removed from buffer, clear their keys to free memory
                 self._remove_span_keys_from_tracking(spans_to_flush)
@@ -377,7 +359,7 @@ class AIQASpanExporter(SpanExporter):
 
         # Release flush_lock before I/O to avoid blocking other flush attempts
         # Spans are already extracted, so concurrent exports won't interfere
-        logger.info(f"flush() sending {len(spans_to_flush)} span(s) to server")
+        logger.info(f"flush: sending {len(spans_to_flush)} span(s) to server")
         try:
             await self._send_spans(spans_to_flush)
             logger.info(f"flush() successfully sent {len(spans_to_flush)} span(s) to server")
@@ -387,7 +369,7 @@ class AIQASpanExporter(SpanExporter):
         except RuntimeError as error:
             if self._is_interpreter_shutdown_error(error):
                 if self.shutdown_requested:
-                    logger.debug(f"flush() skipped due to interpreter shutdown: {error}")
+                    logger.debug(f"flush: skipped due to interpreter shutdown: {error}")
                 else:
                     logger.warning(f"flush() interrupted by interpreter shutdown: {error}")
                 # Put spans back for retry with sync send during shutdown
@@ -426,7 +408,7 @@ class AIQASpanExporter(SpanExporter):
     def _flush_worker(self) -> None:
         """Worker function for auto-flush thread. Runs in a separate thread with its own event loop."""
         import asyncio
-        logger.debug("Auto-flush worker thread started")
+        logger.debug(f"Auto-flush worker thread started")
         
         # Wait for startup delay before beginning flush operations
         # This gives the container/application time to stabilize, which helps avoid startup issues (seen with AWS ECS, Dec 2025).
@@ -441,10 +423,10 @@ class AIQASpanExporter(SpanExporter):
                 remaining_delay -= sleep_time
             
             if self.shutdown_requested:
-                logger.debug("Auto-flush startup delay interrupted by shutdown")
+                logger.debug(f"Auto-flush startup delay interrupted by shutdown")
                 return
             
-            logger.info("Auto-flush startup delay complete, beginning flush operations")
+            logger.info(f"Auto-flush startup delay complete, beginning flush operations")
         
         # Create event loop in this thread (isolated from main thread's event loop)
         # This prevents interference with the main application's event loop
@@ -475,24 +457,23 @@ class AIQASpanExporter(SpanExporter):
             logger.info(f"Auto-flush worker thread stopping (shutdown requested). Completed {cycle_count} cycles.")
             # Don't do final flush here - shutdown() will handle it with synchronous send
             # This avoids event loop shutdown issues
-            logger.debug("Auto-flush thread skipping final flush (will be handled by shutdown() with sync send)")
+            logger.debug(f"Auto-flush thread skipping final flush (will be handled by shutdown() with sync send)")
         finally:
             # Always close the event loop, even if an exception occurs
             try:
                 if not loop.is_closed():
                     loop.close()
-                logger.debug("Auto-flush worker thread event loop closed")
+                logger.debug(f"Auto-flush worker thread event loop closed")
             except Exception:
                 pass  # Ignore errors during cleanup
     
     def _start_auto_flush(self) -> None:
         """Start the auto-flush timer with startup delay."""
         if self.shutdown_requested:
-            logger.warning("_start_auto_flush() called but shutdown already requested")
+            logger.warning(f"_start_auto_flush() called but shutdown already requested")
             return
 
-        logger.info(
-            f"Starting auto-flush thread with interval {self.flush_interval_ms / 1000.0}s, "
+        logger.info(f"Starting auto-flush thread with interval {self.flush_interval_ms / 1000.0}s, "
             f"startup delay {self.startup_delay_seconds}s"
         )
 
@@ -508,15 +489,15 @@ class AIQASpanExporter(SpanExporter):
         # Split into batches if needed
         batches = self._split_into_batches(spans)
         if len(batches) > 1:
-            logger.info(f"_send_spans() splitting {len(spans)} spans into {len(batches)} batches")
+            logger.info(f"_send_spans: splitting {len(spans)} spans into {len(batches)} batches")
         
         url = self._get_span_url()
         headers = self._build_request_headers()
         
-        if self.api_key:
-            logger.debug("_send_spans() using API key authentication")
-        else:
-            logger.debug("_send_spans() no API key provided")
+        if not self._api_key: # This should not happen
+            logger.error(f"_send_spans: fail - no API key provided. {len(spans)} spans lost.")
+            # Spans were already removed from buffer before calling this method. They will now get forgotten
+            return
 
         # Use timeout to prevent hanging on unreachable servers
         timeout = aiohttp.ClientTimeout(total=30.0, connect=10.0)
@@ -524,41 +505,41 @@ class AIQASpanExporter(SpanExporter):
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for batch_idx, batch in enumerate(batches):
                 try:
-                    logger.debug(f"_send_spans() sending batch {batch_idx + 1}/{len(batches)} with {len(batch)} spans to {url}")
+                    logger.debug(f"_send_spans: sending batch {batch_idx + 1}/{len(batches)} with {len(batch)} spans to {url}")
                     # Pre-serialize JSON to bytes and wrap in BytesIO to avoid blocking event loop
                     json_bytes = json.dumps(batch).encode('utf-8')
                     data = io.BytesIO(json_bytes)
                     
                     async with session.post(url, data=data, headers=headers) as response:
-                        logger.debug(f"_send_spans() batch {batch_idx + 1} received response: status={response.status}")
+                        logger.debug(f"_send_spans: batch {batch_idx + 1} received response: status={response.status}")
                         if not response.ok:
                             error_text = await response.text()
                             error_msg = f"Failed to send batch {batch_idx + 1}/{len(batches)}: {response.status} {response.reason} - {error_text[:200]}"
-                            logger.error(f"_send_spans() {error_msg}")
+                            logger.error(f"_send_spans: {error_msg}")
                             errors.append((batch_idx + 1, error_msg))
                             # Continue with other batches even if one fails
                             continue
-                        logger.debug(f"_send_spans() batch {batch_idx + 1} successfully sent {len(batch)} spans")
+                        logger.debug(f"_send_spans: batch {batch_idx + 1} successfully sent {len(batch)} spans")
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     # Network errors and timeouts - log but don't fail completely
                     error_msg = f"Network error in batch {batch_idx + 1}: {type(e).__name__}: {e}"
-                    logger.warning(f"_send_spans() {error_msg} - will retry on next flush")
+                    logger.warning(f"_send_spans: {error_msg} - will retry on next flush")
                     errors.append((batch_idx + 1, error_msg))
                     # Continue with other batches
                 except RuntimeError as e:
                     if self._is_interpreter_shutdown_error(e):
                         if self.shutdown_requested:
-                            logger.debug(f"_send_spans() skipped due to interpreter shutdown: {e}")
+                            logger.debug(f"_send_spans: skipped due to interpreter shutdown: {e}")
                         else:
-                            logger.warning(f"_send_spans() interrupted by interpreter shutdown: {e}")
+                            logger.warning(f"_send_spans: interrupted by interpreter shutdown: {e}")
                         raise
                     error_msg = f"RuntimeError in batch {batch_idx + 1}: {type(e).__name__}: {e}"
-                    logger.error(f"_send_spans() {error_msg}")
+                    logger.error(f"_send_spans: {error_msg}")
                     errors.append((batch_idx + 1, error_msg))
                     # Continue with other batches
                 except Exception as e:
                     error_msg = f"Exception in batch {batch_idx + 1}: {type(e).__name__}: {e}"
-                    logger.error(f"_send_spans() {error_msg}")
+                    logger.error(f"_send_spans: {error_msg}")
                     errors.append((batch_idx + 1, error_msg))
                     # Continue with other batches
         
@@ -568,7 +549,7 @@ class AIQASpanExporter(SpanExporter):
             error_summary = "; ".join([f"batch {idx}: {msg}" for idx, msg in errors])
             raise Exception(f"Failed to send some spans: {error_summary}")
         
-        logger.debug(f"_send_spans() successfully sent all {len(spans)} spans in {len(batches)} batch(es)")
+        logger.debug(f"_send_spans: successfully sent all {len(spans)} spans in {len(batches)} batch(es)")
 
     def _send_spans_sync(self, spans: List[Dict[str, Any]]) -> None:
         """Send spans to the server API (synchronous, for shutdown scenarios). Batches large payloads automatically."""
@@ -582,10 +563,9 @@ class AIQASpanExporter(SpanExporter):
         url = self._get_span_url()
         headers = self._build_request_headers()
         
-        if self.api_key:
-            logger.debug("_send_spans_sync() using API key authentication")
-        else:
-            logger.debug("_send_spans_sync() no API key provided")
+        if not self._api_key:
+            logger.error(f"_send_spans_sync() fail - no API key provided")
+            return
 
         errors = []
         for batch_idx, batch in enumerate(batches):
@@ -616,64 +596,63 @@ class AIQASpanExporter(SpanExporter):
 
     def shutdown(self) -> None:
         """Shutdown the exporter, flushing any remaining spans. Call before process exit."""
-        logger.info("shutdown() called - initiating exporter shutdown")
+        logger.info(f"shutdown: called - initiating exporter shutdown")
         self.shutdown_requested = True
 
         # Check buffer state before shutdown
         with self.buffer_lock:
             buffer_size = len(self.buffer)
-            logger.info(f"shutdown() buffer contains {buffer_size} span(s) before shutdown")
+            logger.info(f"shutdown: buffer contains {buffer_size} span(s) before shutdown")
 
         # Wait for flush thread to finish (it will do final flush)
         # Only wait if thread was actually started
         if self._auto_flush_started and self.flush_timer and self.flush_timer.is_alive():
-            logger.info("shutdown() waiting for auto-flush thread to complete (timeout=10s)")
+            logger.info(f"shutdown: waiting for auto-flush thread to complete (timeout=10s)")
             self.flush_timer.join(timeout=10.0)
             if self.flush_timer.is_alive():
-                logger.warning("shutdown() auto-flush thread did not complete within timeout")
+                logger.warning(f"shutdown: auto-flush thread did not complete within timeout")
             else:
-                logger.info("shutdown() auto-flush thread completed")
+                logger.info(f"shutdown: auto-flush thread completed")
         else:
-            logger.debug("shutdown() no active auto-flush thread to wait for")
+            logger.debug(f"shutdown: no active auto-flush thread to wait for")
 
         # Final flush attempt (use synchronous send to avoid event loop issues)
         with self.flush_lock:
-            logger.debug("shutdown() performing final flush with synchronous send")
+            logger.debug(f"shutdown: performing final flush with synchronous send")
             # Atomically extract and remove spans to prevent race conditions
             spans_to_flush = self._extract_and_remove_spans_from_buffer()
-            logger.debug(f"shutdown() extracted {len(spans_to_flush)} span(s) from buffer for final flush")
+            logger.debug(f"shutdown: extracted {len(spans_to_flush)} span(s) from buffer for final flush")
 
             if spans_to_flush:
-                if not self.server_url:
-                    logger.warning(
-                        f"shutdown() skipping final flush: AIQA_SERVER_URL is not set. "
+                if not self._server_url:
+                    logger.warning(f"shutdown: skipping final flush: AIQA_SERVER_URL is not set. "
                         f"{len(spans_to_flush)} span(s) will not be sent."
                     )
                     # Spans already removed from buffer, clear their keys to free memory
                     self._remove_span_keys_from_tracking(spans_to_flush)
                 else:
-                    logger.info(f"shutdown() sending {len(spans_to_flush)} span(s) to server (synchronous)")
+                    logger.info(f"shutdown: sending {len(spans_to_flush)} span(s) to server (synchronous)")
                     try:
                         self._send_spans_sync(spans_to_flush)
-                        logger.info(f"shutdown() successfully sent {len(spans_to_flush)} span(s) to server")
+                        logger.info(f"shutdown: successfully sent {len(spans_to_flush)} span(s) to server")
                         # Spans already removed from buffer during extraction
                         # Clear their keys from tracking set to free memory
                         self._remove_span_keys_from_tracking(spans_to_flush)
                     except Exception as e:
-                        logger.error(f"shutdown() failed to send spans: {e}")
+                        logger.error(f"shutdown: failed to send spans: {e}")
                         # Spans already removed, but process is exiting anyway
-                        logger.warning(f"shutdown() {len(spans_to_flush)} span(s) were not sent due to error")
+                        logger.warning(f"shutdown: {len(spans_to_flush)} span(s) were not sent due to error")
                         # Keys will remain in tracking set, but process is exiting so memory will be freed
             else:
-                logger.debug("shutdown() no spans to flush")
+                logger.debug(f"shutdown: no spans to flush")
         
         # Check buffer state after shutdown
         with self.buffer_lock:
             buffer_size = len(self.buffer)
             if buffer_size > 0:
-                logger.warning(f"shutdown() buffer still contains {buffer_size} span(s) after shutdown")
+                logger.warning(f"shutdown: buffer still contains {buffer_size} span(s) after shutdown")
             else:
-                logger.info("shutdown() buffer is empty after shutdown")
+                logger.info(f"shutdown: buffer is empty after shutdown")
         
-        logger.info("shutdown() completed")
+        logger.info(f"shutdown: completed")
 

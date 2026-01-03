@@ -7,10 +7,11 @@ import json
 import os
 import dataclasses
 import logging
+from .constants import LOG_TAG
 from datetime import datetime, date, time
 from typing import Any, Callable, Set
 
-logger = logging.getLogger("aiqa")
+logger = logging.getLogger(LOG_TAG)
 
 def toNumber(value: str|int|None) -> int:
     """Convert string to number. handling units like g, m, k, (also mb kb gb though these should be avoided)"""

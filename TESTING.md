@@ -42,19 +42,18 @@ python -m pytest
 
 ```bash
 # Run a specific test file
-pytest aiqa/test_tracing.py
-pytest aiqa/test_experiment_runner.py
-pytest aiqa/test_startup_reliability.py
+pytest tests/test_tracing.py
+pytest tests/test_startup_reliability.py
 ```
 
 ### Running Specific Tests
 
 ```bash
 # Run a specific test class
-pytest aiqa/test_tracing.py::TestGetSpan
+pytest tests/test_tracing.py::TestGetSpan
 
 # Run a specific test method
-pytest aiqa/test_tracing.py::TestGetSpan::test_get_span_success_with_span_id
+pytest tests/test_tracing.py::TestGetSpan::test_get_span_success_with_span_id
 ```
 
 ### Test Output Options

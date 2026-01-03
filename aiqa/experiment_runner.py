@@ -4,6 +4,8 @@ ExperimentRunner - runs experiments on datasets and scores results
 
 import os
 import time
+from .constants import LOG_TAG
+from .http_utils import build_headers, get_server_url, get_api_key, format_http_error
 from typing import Any, Dict, List, Optional, Callable, Awaitable, Union
 import requests
 
@@ -35,18 +37,15 @@ class ExperimentRunner:
         """
         self.dataset_id = dataset_id
         self.experiment_id = experiment_id
-        self.server_url = (server_url or os.getenv("AIQA_SERVER_URL", "")).rstrip("/")
-        self.api_key = api_key or os.getenv("AIQA_API_KEY", "")
+        self.server_url = get_server_url(server_url)
+        self.api_key = get_api_key(api_key)
         self.organisation = organisation_id
         self.experiment: Optional[Dict[str, Any]] = None
         self.scores: List[Dict[str, Any]] = []
 
     def _get_headers(self) -> Dict[str, str]:
         """Build HTTP headers for API requests."""
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"ApiKey {self.api_key}"
-        return headers
+        return build_headers(self.api_key)
 
     def get_dataset(self) -> Dict[str, Any]:
         """
@@ -61,10 +60,7 @@ class ExperimentRunner:
         )
 
         if not response.ok:
-            error_text = response.text if hasattr(response, "text") else "Unknown error"
-            raise Exception(
-                f"Failed to fetch dataset: {response.status_code} {response.reason} - {error_text}"
-            )
+            raise Exception(format_http_error(response, "fetch dataset"))
 
         return response.json()
 
@@ -92,10 +88,7 @@ class ExperimentRunner:
         )
 
         if not response.ok:
-            error_text = response.text if hasattr(response, "text") else "Unknown error"
-            raise Exception(
-                f"Failed to fetch example inputs: {response.status_code} {response.reason} - {error_text}"
-            )
+            raise Exception(format_http_error(response, "fetch example inputs"))
 
         data = response.json()
         return data.get("hits", [])
@@ -130,7 +123,7 @@ class ExperimentRunner:
             "summary_results": {},
         }
 
-        print("Creating experiment")
+        print(f"Creating experiment")
         response = requests.post(
             f"{self.server_url}/experiment",
             json=experiment_setup,
@@ -138,10 +131,7 @@ class ExperimentRunner:
         )
 
         if not response.ok:
-            error_text = response.text if hasattr(response, "text") else "Unknown error"
-            raise Exception(
-                f"Failed to create experiment: {response.status_code} {response.reason} - {error_text}"
-            )
+            raise Exception(format_http_error(response, "create experiment"))
 
         experiment = response.json()
         self.experiment_id = experiment["id"]
@@ -186,10 +176,7 @@ class ExperimentRunner:
         )
 
         if not response.ok:
-            error_text = response.text if hasattr(response, "text") else "Unknown error"
-            raise Exception(
-                f"Failed to score and store: {response.status_code} {response.reason} - {error_text}"
-            )
+            raise Exception(format_http_error(response, "score and store"))
 
         json_result = response.json()
         print(f"scoreAndStore response: {json_result}")
@@ -270,8 +257,7 @@ class ExperimentRunner:
             input_data = example["spans"][0].get("attributes", {}).get("input")
 
         if not input_data:
-            print(
-                f"Warning: Example has no input field or spans with input attribute: {example}"
+            print(f"Warning: Example has no input field or spans with input attribute: {example}"
             )
             # Run engine anyway -- this could make sense if it's all about the parameters
 
@@ -326,10 +312,7 @@ class ExperimentRunner:
         )
 
         if not response.ok:
-            error_text = response.text if hasattr(response, "text") else "Unknown error"
-            raise Exception(
-                f"Failed to fetch summary results: {response.status_code} {response.reason} - {error_text}"
-            )
+            raise Exception(format_http_error(response, "fetch summary results"))
 
         experiment2 = response.json()
         return experiment2.get("summary_results", {})

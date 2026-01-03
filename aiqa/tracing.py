@@ -15,10 +15,11 @@ from opentelemetry.trace import Status, StatusCode, SpanContext, TraceFlags
 from opentelemetry.propagate import inject, extract
 from .aiqa_exporter import AIQASpanExporter
 from .client import get_aiqa_client, get_component_tag, set_component_tag as _set_component_tag, get_aiqa_tracer
-from .constants import AIQA_TRACER_NAME
+from .constants import AIQA_TRACER_NAME, LOG_TAG
 from .object_serialiser import serialize_for_span
+from .http_utils import build_headers, get_server_url, get_api_key
 
-logger = logging.getLogger("AIQA")
+logger = logging.getLogger(LOG_TAG)
 
 
 async def flush_tracing() -> None:
@@ -190,6 +191,7 @@ def _prepare_and_filter_output(
 
 def _handle_span_exception(span: trace.Span, exception: Exception) -> None:
     """Record exception on span and set error status."""
+    logger.info(f"span end: Handling span exception for {span.name}")
     error = exception if isinstance(exception, Exception) else Exception(str(exception))
     span.record_exception(error)
     span.set_status(Status(StatusCode.ERROR, str(error)))
@@ -380,6 +382,34 @@ def _extract_and_set_provider_and_model(span: trace.Span, result: Any) -> None:
         logger.debug(f"Error in _extract_and_set_provider_and_model")
 
 
+def _finalize_span_success_common(
+    span: trace.Span,
+    result_for_metadata: Any,
+    output_data: Any,
+    filter_output: Optional[Callable[[Any], Any]] = None,
+    ignore_output: Optional[List[str]] = None,
+) -> None:
+    """
+    Common logic for finalizing a span with success status.
+    Extracts token usage and provider/model from result, sets output attribute, and sets status to OK.
+    
+    Args:
+        span: The span to finalize
+        result_for_metadata: Value to extract token usage and provider/model from
+        output_data: The output data to set on the span (will be filtered if needed)
+        filter_output: Optional function to filter output data
+        ignore_output: Optional list of keys to exclude from output
+    """
+    logger.info(f"span end: Finalizing for {span.name}")
+    _extract_and_set_token_usage(span, result_for_metadata)
+    _extract_and_set_provider_and_model(span, result_for_metadata)
+    
+    output_data = _prepare_and_filter_output(output_data, filter_output, ignore_output)
+    if output_data is not None:
+        span.set_attribute("output", serialize_for_span(output_data))
+    span.set_status(Status(StatusCode.OK))
+
+
 class TracedGenerator:
     """Wrapper for sync generators that traces iteration."""
     
@@ -428,10 +458,7 @@ class TracedGenerator:
     def _finalize_span_success(self):
         """Set output and success status on span."""
         # Check last yielded value for token usage (common pattern in streaming responses)
-        if self._yielded_values:
-            last_value = self._yielded_values[-1]
-            _extract_and_set_token_usage(self._span, last_value)
-            _extract_and_set_provider_and_model(self._span, last_value)
+        result_for_metadata = self._yielded_values[-1] if self._yielded_values else None
         
         # Record summary of yielded values
         output_data = {
@@ -448,10 +475,13 @@ class TracedGenerator:
             if len(self._yielded_values) > sample_size:
                 output_data["truncated"] = True
         
-        output_data = _prepare_and_filter_output(output_data, self._filter_output, self._ignore_output)
-        if output_data is not None:
-            self._span.set_attribute("output", serialize_for_span(output_data))
-        self._span.set_status(Status(StatusCode.OK))
+        _finalize_span_success_common(
+            self._span,
+            result_for_metadata,
+            output_data,
+            self._filter_output,
+            self._ignore_output,
+        )
 
 
 class TracedAsyncGenerator:
@@ -502,10 +532,7 @@ class TracedAsyncGenerator:
     def _finalize_span_success(self):
         """Set output and success status on span."""
         # Check last yielded value for token usage (common pattern in streaming responses)
-        if self._yielded_values:
-            last_value = self._yielded_values[-1]
-            _extract_and_set_token_usage(self._span, last_value)
-            _extract_and_set_provider_and_model(self._span, last_value)
+        result_for_metadata = self._yielded_values[-1] if self._yielded_values else None
         
         # Record summary of yielded values
         output_data = {
@@ -522,10 +549,13 @@ class TracedAsyncGenerator:
             if len(self._yielded_values) > sample_size:
                 output_data["truncated"] = True
         
-        output_data = _prepare_and_filter_output(output_data, self._filter_output, self._ignore_output)
-        if output_data is not None:
-            self._span.set_attribute("output", serialize_for_span(output_data))
-        self._span.set_status(Status(StatusCode.OK))
+        _finalize_span_success_common(
+            self._span,
+            result_for_metadata,
+            output_data,
+            self._filter_output,
+            self._ignore_output,
+        )
 
 
 def WithTracing(
@@ -585,7 +615,7 @@ def WithTracing(
         if hasattr(fn, "_is_traced"):
             logger.warning(f"Function {fn_name} is already traced, skipping tracing again")
             return fn
-        
+        logger.info(f"WithTracing function {fn_name}")
         is_async = inspect.iscoroutinefunction(fn)
         is_generator = inspect.isgeneratorfunction(fn)
         is_async_generator = inspect.isasyncgenfunction(fn) if hasattr(inspect, 'isasyncgenfunction') else False
@@ -615,15 +645,13 @@ def WithTracing(
         
         def _finalize_span_success(span: trace.Span, result: Any) -> None:
             """Set output and success status on span."""
-            # Extract and set token usage if present (before filtering output)
-            _extract_and_set_token_usage(span, result)
-            # Extract and set provider/model if present (before filtering output)
-            _extract_and_set_provider_and_model(span, result)
-            
-            output_data = _prepare_and_filter_output(result, filter_output, ignore_output)
-            if output_data is not None:
-                span.set_attribute("output", serialize_for_span(output_data))
-            span.set_status(Status(StatusCode.OK))
+            _finalize_span_success_common(
+                span,
+                result,
+                result,
+                filter_output,
+                ignore_output,
+            )
         
         def _execute_with_span_sync(executor: Callable[[], Any], input_data: Any) -> Any:
             """Execute sync function within span context, handling input/output and exceptions."""
@@ -1168,8 +1196,8 @@ def get_span(span_id: str, organisation_id: Optional[str] = None, exclude: Optio
     import os
     import requests
     
-    server_url = os.getenv("AIQA_SERVER_URL", "").rstrip("/")
-    api_key = os.getenv("AIQA_API_KEY", "")
+    server_url = get_server_url()
+    api_key = get_api_key()
     org_id = organisation_id or os.getenv("AIQA_ORGANISATION_ID", "")
     
     if not server_url:
@@ -1190,9 +1218,7 @@ def get_span(span_id: str, organisation_id: Optional[str] = None, exclude: Optio
             "fields": "*" if not exclude else None,
         }
         
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"ApiKey {api_key}"
+        headers = build_headers(api_key)
         
         response = requests.get(url, params=params, headers=headers)
         if response.status_code == 200:
