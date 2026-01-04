@@ -678,6 +678,7 @@ def get_active_span() -> Optional[trace.Span]:
 
 def set_conversation_id(conversation_id: str) -> bool:
     """
+    Naturally a conversation might span several traces. 
     Set the gen_ai.conversation.id attribute on the active span.
     This allows you to group multiple traces together that are part of the same conversation.
     See https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-events/ for more details.
