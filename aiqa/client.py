@@ -2,10 +2,11 @@
 import os
 import logging
 from functools import lru_cache
-from typing import Optional, TYPE_CHECKING, Any
+from typing import Optional, TYPE_CHECKING, Any, Dict
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+import requests
 
 from .constants import AIQA_TRACER_NAME, LOG_TAG
 
@@ -30,7 +31,7 @@ except ImportError:
         # Set to None so we can check later
         TraceIdRatioBased = None
 
-from .http_utils import get_server_url, get_api_key
+from .http_utils import get_server_url, get_api_key, build_headers, format_http_error
 
 class AIQAClient:
     """
@@ -106,6 +107,7 @@ class AIQAClient:
             logger.error(f"Error shutting down tracing: {e}")
             # Still disable even if shutdown had errors
             self.enabled = False
+
 
 
 # Global singleton instance
@@ -267,3 +269,65 @@ def get_aiqa_tracer() -> trace.Tracer:
         # Log issue but still return a tracer
         logger.info(f"Issue getting AIQA tracer with version: {e}, using fallback")
         return trace.get_tracer(AIQA_TRACER_NAME)
+
+
+def get_organisation(
+    organisation_id: str,
+    server_url: Optional[str] = None,
+    api_key: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Get organisation information based on API key via an API call.
+    
+    Args:
+        organisation_id: ID of the organisation to retrieve
+        server_url: Optional server URL (defaults to AIQA_SERVER_URL env var)
+        api_key: Optional API key (defaults to AIQA_API_KEY env var)
+    
+    Returns:
+        Organisation object as a dictionary
+    """
+    url = get_server_url(server_url)
+    key = get_api_key(api_key)
+    headers = build_headers(key)
+    
+    response = requests.get(
+        f"{url}/organisation/{organisation_id}",
+        headers=headers,
+    )
+    
+    if not response.ok:
+        raise Exception(format_http_error(response, "get organisation"))
+    
+    return response.json()
+
+
+def get_api_key_info(
+    api_key_id: str,
+    server_url: Optional[str] = None,
+    api_key: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Get API key information via an API call.
+    
+    Args:
+        api_key_id: ID of the API key to retrieve
+        server_url: Optional server URL (defaults to AIQA_SERVER_URL env var)
+        api_key: Optional API key (defaults to AIQA_API_KEY env var)
+    
+    Returns:
+        ApiKey object as a dictionary
+    """
+    url = get_server_url(server_url)
+    key = get_api_key(api_key)
+    headers = build_headers(key)
+    
+    response = requests.get(
+        f"{url}/api-key/{api_key_id}",
+        headers=headers,
+    )
+    
+    if not response.ok:
+        raise Exception(format_http_error(response, "get api key info"))
+    
+    return response.json()
