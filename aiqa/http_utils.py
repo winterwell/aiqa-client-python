@@ -33,9 +33,9 @@ def get_server_url(server_url: Optional[str] = None) -> str:
         server_url: Optional server URL. If not provided, will get from AIQA_SERVER_URL env var.
     
     Returns:
-        Server URL with trailing slash removed, or empty string if not set.
+        Server URL with trailing slash removed. Defaults to https://server-aiqa.winterwell.com if not set.
     """
-    url = server_url or os.getenv("AIQA_SERVER_URL", "")
+    url = server_url or os.getenv("AIQA_SERVER_URL", "https://server-aiqa.winterwell.com")
     return url.rstrip("/")
 
 

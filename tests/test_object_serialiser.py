@@ -18,7 +18,6 @@ from aiqa.object_serialiser import (
     object_to_dict,
     SizeLimitedJSONEncoder,
     safe_json_dumps,
-    json_default_handler_factory,
 )
 
 
@@ -381,35 +380,3 @@ class TestSafeJSONDumps:
         result = safe_json_dumps(obj)
         assert isinstance(result, str)
         assert "2023-01-01" in result
-
-
-class TestJSONDefaultHandlerFactory:
-    """Tests for json_default_handler_factory function."""
-
-    def test_datetime_handling(self):
-        """Test that datetime objects are handled."""
-        handler = json_default_handler_factory(set())
-        dt = datetime(2023, 1, 1, 12, 30, 45)
-        result = handler(dt)
-        assert isinstance(result, str)
-        assert "2023-01-01" in result
-
-    def test_bytes_handling(self):
-        """Test that bytes are handled."""
-        handler = json_default_handler_factory(set())
-        data = b"hello world"
-        result = handler(data)
-        assert result == "hello world"
-
-    def test_custom_object(self):
-        """Test that custom objects are converted."""
-        handler = json_default_handler_factory(set())
-        
-        class TestClass:
-            def __init__(self):
-                self.name = "test"
-        
-        obj = TestClass()
-        result = handler(obj)
-        assert isinstance(result, dict)
-        assert result["name"] == "test"

@@ -16,7 +16,7 @@ from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 from .constants import AIQA_TRACER_NAME, VERSION, LOG_TAG
 from .http_utils import get_server_url, get_api_key, build_headers
-from .object_serialiser import toNumber
+from .object_serialiser import toNumber, safe_json_dumps
 
 logger = logging.getLogger(LOG_TAG)
 
@@ -41,7 +41,7 @@ class AIQASpanExporter(SpanExporter):
         Initialize the AIQA span exporter.
 
         Args:
-            server_url: URL of the AIQA server (defaults to AIQA_SERVER_URL env var)
+            server_url: URL of the AIQA server (defaults to AIQA_SERVER_URL env var or https://server-aiqa.winterwell.com)
             api_key: API key for authentication (defaults to AIQA_API_KEY env var)
             flush_interval_seconds: How often to flush spans to the server
             max_batch_size_bytes: Maximum size of a single batch in bytes (default: 5mb)
@@ -287,7 +287,7 @@ class AIQASpanExporter(SpanExporter):
         """
         if span_key in self._span_size_cache:
             return self._span_size_cache[span_key]
-        span_json = json.dumps(serialized)
+        span_json = safe_json_dumps(serialized)
         span_size = len(span_json.encode('utf-8'))
         # Only cache if we have valid keys and cache isn't too large
         if span_key[0] and span_key[1] and len(self._span_size_cache) < self._max_cache_size:

@@ -178,11 +178,10 @@ def _init_tracing() -> None:
         server_url = get_server_url()
         api_key = get_api_key()
         
-        if not server_url or not api_key:
+        if not api_key:
             client.enabled = False
-            missing_vars = [var for var, val in [("AIQA_SERVER_URL", server_url), ("AIQA_API_KEY", api_key)] if not val]
             logger.warning(
-                f"AIQA tracing is disabled: missing required environment variables: {', '.join(missing_vars)}"
+                f"AIQA tracing is disabled: missing required environment variables: AIQA_API_KEY"
             )
             client._initialized = True
             return

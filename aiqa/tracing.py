@@ -8,6 +8,7 @@ import logging
 import inspect
 import os
 import copy
+import requests
 from typing import Any, Callable, Optional, List
 from functools import wraps
 from opentelemetry import trace
@@ -117,12 +118,10 @@ class TracingOptions:
         self.filter_output = filter_output
 
 
-def _prepare_input(args: tuple, kwargs: dict) -> Any:
+def _prepare_input(args: tuple, kwargs: dict, sig: Optional[inspect.Signature] = None) -> Any:
     """Prepare input for span attributes. 
-    Aims to produce nice span attributes for the input, since {args, kwargs} is not a natural way to read function input. 
-    So can "unwrap" the args, kwargs.
-    
-    For single-arg-dicts or kwargs-only, returns a shallow copy of the input data.
+    Converts args and kwargs into a unified dict structure using function signature when available.
+    Falls back to legacy behavior for functions without inspectable signatures.
     
     Note: This function does NOT serialize values - it just structures the data.
     Serialization happens later via serialize_for_span() to avoid double-encoding
@@ -130,6 +129,22 @@ def _prepare_input(args: tuple, kwargs: dict) -> Any:
     """
     if not args and not kwargs:
         return None
+    
+    # Try to bind args to parameter names using function signature
+    if sig is not None:
+        try:
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            # Return dict of all arguments (positional args are now named)
+            result = bound.arguments.copy()
+            # Shallow copy to protect against mutating the input
+            return result
+        except (TypeError, ValueError):
+            # Binding failed (e.g., wrong number of args, *args/**kwargs issues)
+            # Fall through to legacy behavior
+            pass
+    
+    # in case binding fails
     if not kwargs:
         if len(args) == 1:
             arg0 = args[0]
@@ -150,15 +165,17 @@ def _prepare_and_filter_input(
     kwargs: dict,
     filter_input: Optional[Callable[[Any], Any]],
     ignore_input: Optional[List[str]],
+    sig: Optional[inspect.Signature] = None,
 ) -> Any:
     """
     Prepare and filter input for span attributes - applies the user's filter_input and ignore_input.
-    For single-arg-dicts or kwargs-only, returns a shallow copy of the input data.
+    Converts all args to a dict using function signature when available.
     """
     # Handle "self" in ignore_input by skipping the first argument
     filtered_args = args
     filtered_kwargs = kwargs.copy() if kwargs else {}
     filtered_ignore_input = ignore_input
+    filtered_sig = sig
     if ignore_input and "self" in ignore_input:
         # Remove "self" from ignore_input list (we'll handle it specially)
         filtered_ignore_input = [key for key in ignore_input if key != "self"]
@@ -168,8 +185,14 @@ def _prepare_and_filter_input(
         # Also remove "self" from kwargs if present
         if "self" in filtered_kwargs:
             del filtered_kwargs["self"]
-    # turn args, kwargs into one "nice" object
-    input_data = _prepare_input(filtered_args, filtered_kwargs)
+        # Adjust signature to remove "self" parameter if present
+        # This is needed because we removed self from args, so signature binding will fail otherwise
+        if filtered_sig is not None:
+            params = list(filtered_sig.parameters.values())
+            if params and params[0].name == "self":
+                filtered_sig = filtered_sig.replace(parameters=params[1:])
+    # turn args, kwargs into one "nice" object (now always a dict when signature is available)
+    input_data = _prepare_input(filtered_args, filtered_kwargs, filtered_sig)
     if filter_input and input_data is not None:
         input_data = filter_input(input_data)
     if filtered_ignore_input and len(filtered_ignore_input) > 0:
@@ -447,6 +470,15 @@ def WithTracing(
         is_generator = inspect.isgeneratorfunction(fn)
         is_async_generator = inspect.isasyncgenfunction(fn) if hasattr(inspect, 'isasyncgenfunction') else False
         
+        # Get function signature once at decoration time for efficient arg name resolution
+        fn_sig: Optional[inspect.Signature] = None
+        try:
+            fn_sig = inspect.signature(fn)
+        except (ValueError, TypeError):
+            # Some callables (e.g., builtins, C extensions) don't have inspectable signatures
+            # Will fall back to legacy behavior
+            pass
+        
         # Don't get tracer here - get it lazily when function is called
         # This ensures initialization only happens when tracing is actually used
         
@@ -595,7 +627,7 @@ def WithTracing(
         if is_async_generator:
             @wraps(fn)
             async def async_gen_traced_fn(*args, **kwargs):
-                input_data = _prepare_and_filter_input(args, kwargs, filter_input, ignore_input)
+                input_data = _prepare_and_filter_input(args, kwargs, filter_input, ignore_input, fn_sig)
                 return await _execute_generator_async(
                     lambda: fn(*args, **kwargs),
                     input_data
@@ -607,7 +639,7 @@ def WithTracing(
         elif is_generator:
             @wraps(fn)
             def gen_traced_fn(*args, **kwargs):
-                input_data = _prepare_and_filter_input(args, kwargs, filter_input, ignore_input)
+                input_data = _prepare_and_filter_input(args, kwargs, filter_input, ignore_input, fn_sig)
                 return _execute_generator_sync(
                     lambda: fn(*args, **kwargs),
                     input_data
@@ -619,7 +651,7 @@ def WithTracing(
         elif is_async:
             @wraps(fn)
             async def async_traced_fn(*args, **kwargs):
-                input_data = _prepare_and_filter_input(args, kwargs, filter_input, ignore_input)
+                input_data = _prepare_and_filter_input(args, kwargs, filter_input, ignore_input, fn_sig)
                 return await _execute_with_span_async(
                     lambda: fn(*args, **kwargs),
                     input_data
@@ -631,7 +663,7 @@ def WithTracing(
         else:
             @wraps(fn)
             def sync_traced_fn(*args, **kwargs):
-                input_data = _prepare_and_filter_input(args, kwargs, filter_input, ignore_input)
+                input_data = _prepare_and_filter_input(args, kwargs, filter_input, ignore_input, fn_sig)
                 return _execute_with_span_sync(
                     lambda: fn(*args, **kwargs),
                     input_data
@@ -1028,14 +1060,12 @@ def get_span(span_id: str, organisation_id: Optional[str] = None, exclude: Optio
             print(f"Found span: {span['name']}")
             my_function(**span['input'])
     """
-    import os
-    import requests
-    
     server_url = get_server_url()
     api_key = get_api_key()
     org_id = organisation_id or os.getenv("AIQA_ORGANISATION_ID", "")
     
-    if not server_url:
+    # Check if server_url is the default (meaning AIQA_SERVER_URL was not set)
+    if not os.getenv("AIQA_SERVER_URL"):
         raise ValueError("AIQA_SERVER_URL is not set. Cannot retrieve span.")    
     if not org_id:
         raise ValueError("Organisation ID is required. Provide it as parameter or set AIQA_ORGANISATION_ID environment variable.")

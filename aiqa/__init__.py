@@ -6,7 +6,7 @@ The client initializes automatically when WithTracing is first used.
 
 Set environment variables:
     AIQA_SERVER_URL: URL of the AIQA server
-    AIQA_API_KEY: API key for authentication
+    AIQA_API_KEY: API key for authentication (required)
     AIQA_COMPONENT_TAG: Optional component identifier
     AIQA_STARTUP_DELAY_SECONDS: Optional delay before first flush (default: 10s)
 
