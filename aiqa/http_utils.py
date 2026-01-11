@@ -15,9 +15,12 @@ def build_headers(api_key: Optional[str] = None) -> Dict[str, str]:
         api_key: Optional API key. If not provided, will try to get from AIQA_API_KEY env var.
     
     Returns:
-        Dictionary with Content-Type and optionally Authorization header.
+        Dictionary with Content-Type, Accept-Encoding, and optionally Authorization header.
     """
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept-Encoding": "gzip, deflate, br",  # Request compression (aiohttp handles decompression automatically)
+    }
     if api_key:
         headers["Authorization"] = f"ApiKey {api_key}"
     elif os.getenv("AIQA_API_KEY"):
