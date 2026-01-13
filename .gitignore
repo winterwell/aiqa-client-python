@@ -8,3 +8,4 @@ build/
 .Python
 .pypirc
 venv
+.env
