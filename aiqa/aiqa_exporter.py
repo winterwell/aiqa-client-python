@@ -228,8 +228,8 @@ class AIQASpanExporter(SpanExporter):
             "name": span.name,
             "kind": span_kind,
             "parentSpanId": parent_span_id,
-            "startTime": self._time_to_tuple(span.start_time),
-            "endTime": self._time_to_tuple(span.end_time) if span.end_time else None,
+            "startTime": self._time_to_millis(span.start_time),
+            "endTime": self._time_to_millis(span.end_time) if span.end_time else None,
             "status": {
                 "code": status_code,
                 "message": getattr(span.status, "description", None),
@@ -248,7 +248,7 @@ class AIQASpanExporter(SpanExporter):
             "events": [
                 {
                     "name": event.name,
-                    "time": self._time_to_tuple(event.timestamp),
+                    "time": self._time_to_millis(event.timestamp),
                     "attributes": dict(event.attributes) if event.attributes else {},
                 }
                 for event in (span.events or [])
@@ -259,7 +259,7 @@ class AIQASpanExporter(SpanExporter):
             "traceId": format(span_context.trace_id, "032x"),
             "spanId": format(span_context.span_id, "016x"),
             "traceFlags": span_context.trace_flags,
-            "duration": self._time_to_tuple(span.end_time - span.start_time) if span.end_time else None,
+            "duration": self._time_to_millis(span.end_time - span.start_time) if span.end_time else None,
             "ended": span.end_time is not None,
             "instrumentationLibrary": self._get_instrumentation_library(span),
         }
@@ -273,11 +273,9 @@ class AIQASpanExporter(SpanExporter):
             "version": VERSION,
         }
 
-    def _time_to_tuple(self, nanoseconds: int) -> tuple:
-        """Convert nanoseconds to (seconds, nanoseconds) tuple."""
-        seconds = int(nanoseconds // 1_000_000_000)
-        nanos = int(nanoseconds % 1_000_000_000)
-        return (seconds, nanos)
+    def _time_to_millis(self, nanoseconds: int) -> int:
+        """Convert nanoseconds to epoch milliseconds."""
+        return int(nanoseconds // 1_000_000)
 
     def _get_span_size(self, span_key: tuple, serialized: Dict[str, Any]) -> int:
         """
