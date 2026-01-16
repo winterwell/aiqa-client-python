@@ -6,6 +6,7 @@ from typing import Optional, TYPE_CHECKING, Any, Dict
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 import requests
 
 from .constants import AIQA_TRACER_NAME, LOG_TAG
@@ -101,8 +102,7 @@ class AIQAClient:
             self.enabled = False
             if self._provider:
                 self._provider.shutdown()
-            if self._exporter:
-                self._exporter.shutdown()
+            # OTLP exporter doesn't have a separate shutdown method - it's handled by the provider
         except Exception as e:
             logger.error(f"Error shutting down tracing: {e}")
             # Still disable even if shutdown had errors
@@ -228,20 +228,39 @@ def _init_tracing() -> None:
 
 def _attach_aiqa_processor(provider: TracerProvider) -> None:
     """Attach AIQA span processor to the provider. Idempotent - safe to call multiple times."""
-    from .aiqa_exporter import AIQASpanExporter
-    
     try:
         # Check if already attached
         for p in provider._active_span_processor._span_processors:
-            if isinstance(getattr(p, "exporter", None), AIQASpanExporter):
+            if isinstance(getattr(p, "exporter", None), OTLPSpanExporter):
                 logger.debug(f"AIQA span processor already attached, skipping")
                 return
 
-        exporter = AIQASpanExporter(
-            server_url=os.getenv("AIQA_SERVER_URL"),
-            api_key=os.getenv("AIQA_API_KEY"),
-            # max_buffer_spans will be read from AIQA_MAX_BUFFER_SPANS env var by the exporter
+        server_url = get_server_url()
+        api_key = get_api_key()
+        
+        # Build headers for authentication
+        # OTLP exporter sets its own Content-Type, so we only need Authorization
+        auth_headers = {}
+        if api_key:
+            auth_headers["Authorization"] = f"ApiKey {api_key}"
+        elif os.getenv("AIQA_API_KEY"):
+            auth_headers["Authorization"] = f"ApiKey {os.getenv('AIQA_API_KEY')}"
+        
+        # OTLP HTTP exporter requires the full endpoint URL including /v1/traces
+        # Ensure server_url doesn't have trailing slash or /v1/traces, then append /v1/traces
+        base_url = server_url.rstrip('/')
+        if base_url.endswith('/v1/traces'):
+            endpoint = base_url
+        else:
+            endpoint = f"{base_url}/v1/traces"
+        
+        # Create OTLP exporter with authentication headers only
+        # The exporter will set Content-Type and other headers automatically
+        exporter = OTLPSpanExporter(
+            endpoint=endpoint,
+            headers=auth_headers if auth_headers else None,
         )
+        
         provider.add_span_processor(BatchSpanProcessor(exporter))
         global client
         client.exporter = exporter

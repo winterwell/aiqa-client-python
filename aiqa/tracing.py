@@ -15,7 +15,6 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.trace import Status, StatusCode, SpanContext, TraceFlags
 from opentelemetry.propagate import inject, extract
-from .aiqa_exporter import AIQASpanExporter
 from .client import get_aiqa_client, get_component_tag, set_component_tag as _set_component_tag, get_aiqa_tracer
 from .constants import AIQA_TRACER_NAME, LOG_TAG
 from .object_serialiser import serialize_for_span
@@ -32,13 +31,11 @@ async def flush_tracing() -> None:
     if you want to flush immediately, e.g. before exiting a process.
     A common use is if you are tracing unit tests or experiment runs.
 
-    This flushes both the BatchSpanProcessor and the exporter buffer.
+    This flushes the BatchSpanProcessor (OTLP exporter doesn't have a separate flush method).
     """
     client = get_aiqa_client()
     if client.provider:
         client.provider.force_flush()  # Synchronous method
-    if client.exporter:    
-        await client.exporter.flush()
 
 
 # Export provider and exporter accessors for advanced usage

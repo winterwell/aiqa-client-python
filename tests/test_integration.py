@@ -17,7 +17,7 @@ import uuid
 import pytest
 import requests
 from typing import Optional, Dict, Any, List
-from aiqa import get_aiqa_client, WithTracing, flush_tracing
+from aiqa import WithTracing, flush_tracing
 from aiqa.http_utils import get_server_url, get_api_key, build_headers
 from dotenv import load_dotenv
 
@@ -55,6 +55,8 @@ def query_spans(query: str, limit: int = 100) -> Dict[str, Any]:
     
     headers = build_headers(api_key)
     
+    # Don't accept compressed responses to avoid parsing issues
+    headers['Accept-Encoding'] = 'identity'
     response = requests.get(url, params=params, headers=headers)
     if response.status_code != 200:
         raise ValueError(f"Failed to query spans: {response.status_code} - {response.text[:500]}")
@@ -130,9 +132,6 @@ def check_server_available():
 @pytest.mark.asyncio
 async def test_basic_span_generation_and_retrieval(test_marker, check_server_available):
     """Test that a simple span is generated and can be retrieved from the server."""
-    # Reset client to ensure clean state
-    client = get_aiqa_client()
-    
     # Create a traced function with a unique name
     @WithTracing(name=f"test_function_{test_marker}")
     def test_function(x: int, y: int) -> int:
@@ -165,8 +164,6 @@ async def test_basic_span_generation_and_retrieval(test_marker, check_server_ava
 @pytest.mark.asyncio
 async def test_multiple_spans_generation(test_marker, check_server_available):
     """Test that multiple spans are generated and can be retrieved."""
-    client = get_aiqa_client()
-    
     # Create multiple traced functions
     @WithTracing(name=f"test_func_a_{test_marker}")
     def func_a(x: int) -> int:
@@ -211,8 +208,6 @@ async def test_multiple_spans_generation(test_marker, check_server_available):
 @pytest.mark.asyncio
 async def test_span_with_attributes(test_marker, check_server_available):
     """Test that spans with attributes are correctly stored and retrieved."""
-    client = get_aiqa_client()
-    
     # Create a function that will have input/output attributes
     @WithTracing(name=f"test_attrs_{test_marker}")
     def function_with_attrs(data: dict) -> dict:
@@ -248,8 +243,6 @@ async def test_span_with_attributes(test_marker, check_server_available):
 @pytest.mark.asyncio
 async def test_span_status_code(test_marker, check_server_available):
     """Test that span status codes are correctly stored."""
-    client = get_aiqa_client()
-    
     # Create a function that succeeds
     @WithTracing(name=f"test_success_{test_marker}")
     def successful_function() -> str:
