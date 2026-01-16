@@ -55,6 +55,8 @@ def check_server_available():
         pytest.skip("AIQA_SERVER_URL and AIQA_API_KEY environment variables must be set")
     
     # Try to connect to server
+    # Any HTTP response (even error codes) means the server is up and responding
+    # Only connection errors (timeout, DNS failure, etc.) mean the server is down
     try:
         url = f"{server_url.rstrip('/')}/span"
         headers = build_headers(api_key)
@@ -64,11 +66,8 @@ def check_server_available():
             headers=headers,
             timeout=5
         )
-        # 200 means server is up (even if no results)
-        # 401/403 means server is up but auth failed
-        # Other errors might mean server is down
-        if response.status_code not in [200, 401, 403]:
-            pytest.skip(f"Server appears to be down (status {response.status_code})")
+        # Any HTTP response means server is up (even 400, 404, 500, etc.)
+        # We got a response, so server is available
     except requests.exceptions.RequestException as e:
         pytest.skip(f"Cannot connect to server: {e}")
 
@@ -83,6 +82,7 @@ def test_get_api_key_info(check_server_available):
     
     # Test get_api_key_info - it should load server_url and api_key from .env
     api_key_info = get_api_key_info(api_key_id)
+    print(f"API key info: {api_key_info}")
     
     # Verify the response structure
     assert api_key_info is not None, "API key info should not be None"

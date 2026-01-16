@@ -111,6 +111,8 @@ def check_server_available():
         pytest.skip("AIQA_SERVER_URL and AIQA_API_KEY environment variables must be set")
     
     # Try to connect to server
+    # Any HTTP response (even error codes) means the server is up and responding
+    # Only connection errors (timeout, DNS failure, etc.) mean the server is down
     try:
         url = f"{server_url.rstrip('/')}/span"
         headers = build_headers(api_key)
@@ -120,11 +122,8 @@ def check_server_available():
             headers=headers,
             timeout=5
         )
-        # 200 means server is up (even if no results)
-        # 401/403 means server is up but auth failed
-        # Other errors might mean server is down
-        if response.status_code not in [200, 401, 403]:
-            pytest.skip(f"Server appears to be down (status {response.status_code})")
+        # Any HTTP response means server is up (even 400, 404, 500, etc.)
+        # We got a response, so server is available
     except requests.exceptions.RequestException as e:
         pytest.skip(f"Cannot connect to server: {e}")
 
@@ -282,4 +281,42 @@ async def test_span_status_code(test_marker, check_server_available):
     # Verify status codes
     assert success_span.get("status", {}).get("code") == 1, "Success span should have OK status (1)"
     assert error_span.get("status", {}).get("code") == 2, "Error span should have ERROR status (2)"
+
+
+@pytest.mark.asyncio
+async def test_span_auto_flush_no_explicit_flush(test_marker, check_server_available):
+    """
+    Test that spans are automatically sent to the server without requiring an explicit flush.
+    
+    This verifies that the BatchSpanProcessor automatically flushes spans periodically,
+    so users don't need to call flush_tracing() in normal operation.
+    """
+    # Create a traced function with a unique name
+    @WithTracing(name=f"test_auto_flush_{test_marker}")
+    def test_function(x: int, y: int) -> int:
+        """A simple test function that should auto-flush."""
+        return x * y
+    
+    # Call the function to generate a span
+    result = test_function(7, 6)
+    assert result == 42
+    
+    # IMPORTANT: Do NOT call flush_tracing() here
+    # The span should be automatically sent by BatchSpanProcessor
+    
+    # Wait for span to appear in server with longer timeout to allow for auto-flush
+    # BatchSpanProcessor typically flushes every 5 seconds, so we wait at least 10 seconds
+    query = f'name:test_auto_flush_{test_marker}'
+    hits = wait_for_spans(query, expected_count=1, max_wait_seconds=15, poll_interval=0.5)
+    
+    assert len(hits) >= 1, f"Expected at least 1 span to be auto-flushed, found {len(hits)}"
+    
+    # Find our span
+    span = hits[0]
+    assert span["name"] == f"test_auto_flush_{test_marker}"
+    assert span.get("status", {}).get("code") == 1  # OK status
+    assert "traceId" in span
+    assert "spanId" in span
+    assert "startTime" in span
+    assert "endTime" in span
 
