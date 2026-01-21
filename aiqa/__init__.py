@@ -26,8 +26,8 @@ Example:
     result = my_function()
 """
 
-from .tracing import (
-    WithTracing,
+from .tracing import WithTracing
+from .span_helpers import (
     flush_tracing,
     set_span_attribute,
     set_span_name,
@@ -39,7 +39,10 @@ from .tracing import (
     extract_trace_context,
     set_conversation_id,
     set_component_tag,
+    set_token_usage,
+    set_provider_and_model,
     get_span,
+    submit_feedback,
 )
 from .client import get_aiqa_client
 from .experiment_runner import ExperimentRunner
@@ -60,7 +63,10 @@ __all__ = [
     "extract_trace_context",
     "set_conversation_id",
     "set_component_tag",
+    "set_token_usage",
+    "set_provider_and_model",
     "get_span",
+    "submit_feedback",
     "VERSION",
 ]
 

@@ -38,15 +38,17 @@ def _extract_and_set_token_usage(span: trace.Span, result: Any) -> None:
     Extract OpenAI API style token usage from result and add to span attributes
     using OpenTelemetry semantic conventions for gen_ai.
     
-    Looks for usage dict with prompt_tokens, completion_tokens, and total_tokens.
+    Looks for usage dict or object with prompt_tokens, completion_tokens, and total_tokens.
     Sets gen_ai.usage.input_tokens, gen_ai.usage.output_tokens, and gen_ai.usage.total_tokens.
     Only sets attributes that are not already set.
     
     This function detects token usage from OpenAI API response patterns:
-    - OpenAI Chat Completions API: The 'usage' object contains 'prompt_tokens', 'completion_tokens', and 'total_tokens'.
+    - OpenAI Chat Completions API: The 'usage' object (dict or Usage object) contains 'prompt_tokens', 'completion_tokens', and 'total_tokens'.
       See https://platform.openai.com/docs/api-reference/chat/object (usage field)
     - OpenAI Completions API: The 'usage' object contains 'prompt_tokens', 'completion_tokens', and 'total_tokens'.
       See https://platform.openai.com/docs/api-reference/completions/object (usage field)
+    
+    Handles both dict and object cases (e.g., OpenAI SDK Usage objects).
     
     This function is safe against exceptions and will not derail tracing or program execution.
     """
@@ -74,15 +76,24 @@ def _extract_and_set_token_usage(span: trace.Span, result: Any) -> None:
             # If accessing result properties fails, just return silently
             return
         
-        # Extract token usage if found
-        if isinstance(usage, dict):
+        # Extract token usage if found (handle both dict and object cases)
+        if usage is not None:
             try:
                 # Support both OpenAI format (prompt_tokens/completion_tokens) and Bedrock format (input_tokens/output_tokens)
-                prompt_tokens = usage.get("prompt_tokens") or usage.get("PromptTokens")
-                completion_tokens = usage.get("completion_tokens") or usage.get("CompletionTokens")
-                input_tokens = usage.get("input_tokens") or usage.get("InputTokens")
-                output_tokens = usage.get("output_tokens") or usage.get("OutputTokens")
-                total_tokens = usage.get("total_tokens") or usage.get("TotalTokens")
+                # Handle dict case
+                if isinstance(usage, dict):
+                    prompt_tokens = usage.get("prompt_tokens") or usage.get("PromptTokens")
+                    completion_tokens = usage.get("completion_tokens") or usage.get("CompletionTokens")
+                    input_tokens = usage.get("input_tokens") or usage.get("InputTokens")
+                    output_tokens = usage.get("output_tokens") or usage.get("OutputTokens")
+                    total_tokens = usage.get("total_tokens") or usage.get("TotalTokens")
+                # Handle object case (e.g., OpenAI Usage object)
+                else:
+                    prompt_tokens = getattr(usage, "prompt_tokens", None) or getattr(usage, "PromptTokens", None)
+                    completion_tokens = getattr(usage, "completion_tokens", None) or getattr(usage, "CompletionTokens", None)
+                    input_tokens = getattr(usage, "input_tokens", None) or getattr(usage, "InputTokens", None)
+                    output_tokens = getattr(usage, "output_tokens", None) or getattr(usage, "OutputTokens", None)
+                    total_tokens = getattr(usage, "total_tokens", None) or getattr(usage, "TotalTokens", None)
                 
                 # Use Bedrock format if OpenAI format not available
                 if prompt_tokens is None:

@@ -5,8 +5,10 @@ from functools import lru_cache
 from typing import Optional, TYPE_CHECKING, Any, Dict
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, SpanExportResult, SpanExporter as SpanExporterBase
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.trace import SpanContext
 import requests
 
 from .constants import AIQA_TRACER_NAME, LOG_TAG
@@ -254,11 +256,24 @@ def _attach_aiqa_processor(provider: TracerProvider) -> None:
         else:
             endpoint = f"{base_url}/v1/traces"
         
-        # Create OTLP exporter with authentication headers only
+        # Get timeout from environment variable (in seconds)
+        # Supports OTEL_EXPORTER_OTLP_TIMEOUT (standard) or AIQA_EXPORT_TIMEOUT (custom)
+        # Default is 30 seconds (more generous than OTLP default of 10s)
+        timeout = 30.0
+        otlp_timeout = os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
+        
+        if otlp_timeout:
+            try:
+                timeout = float(otlp_timeout)
+            except ValueError:
+                logger.warning(f"Invalid OTEL_EXPORTER_OTLP_TIMEOUT value '{otlp_timeout}', using default 30.0")
+        
+        # Create OTLP exporter with authentication headers and timeout
         # The exporter will set Content-Type and other headers automatically
         exporter = OTLPSpanExporter(
             endpoint=endpoint,
             headers=auth_headers if auth_headers else None,
+            timeout=timeout,
         )
         
         provider.add_span_processor(BatchSpanProcessor(exporter))

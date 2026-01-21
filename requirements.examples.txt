@@ -6,4 +6,6 @@ aiohttp>=3.9.0
 
 fastapi
 dotenv
+openai>=1.0.0
+ddgs>=5.0.0
 

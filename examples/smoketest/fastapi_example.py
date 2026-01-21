@@ -7,7 +7,7 @@ import os
 load_dotenv()
 
 # Import tracing decorators/utilities from your aiqa client
-from aiqa.tracing import WithTracing, set_span_attribute, flush_tracing
+from aiqa import WithTracing, set_span_attribute, flush_tracing
 
 app = FastAPI()
 

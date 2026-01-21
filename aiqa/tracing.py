@@ -1,51 +1,24 @@
 """
-OpenTelemetry tracing setup and utilities. Initializes tracer provider on import.
-Provides WithTracing decorator to automatically trace function calls.
+OpenTelemetry tracing decorator. Provides WithTracing decorator to automatically trace function calls.
 """
 
-import json
 import logging
 import inspect
-import os
-import copy
-import requests
+import fnmatch
 from typing import Any, Callable, Optional, List
 from functools import wraps
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.trace import Status, StatusCode, SpanContext, TraceFlags
-from opentelemetry.propagate import inject, extract
-from .client import get_aiqa_client, get_component_tag, set_component_tag as _set_component_tag, get_aiqa_tracer
-from .constants import AIQA_TRACER_NAME, LOG_TAG
+from opentelemetry.trace import Status, StatusCode
+
+from .client import get_aiqa_client, get_component_tag, get_aiqa_tracer
+from .constants import LOG_TAG
 from .object_serialiser import serialize_for_span
-from .http_utils import build_headers, get_server_url, get_api_key
 from .tracing_llm_utils import _extract_and_set_token_usage, _extract_and_set_provider_and_model
 
 logger = logging.getLogger(LOG_TAG)
 
 
-async def flush_tracing() -> None:
-    """
-    Flush all pending spans to the server.
-    Flushes also happen automatically every few seconds. So you only need to call this function
-    if you want to flush immediately, e.g. before exiting a process.
-    A common use is if you are tracing unit tests or experiment runs.
-
-    This flushes the BatchSpanProcessor (OTLP exporter doesn't have a separate flush method).
-    """
-    client = get_aiqa_client()
-    if client.provider:
-        client.provider.force_flush()  # Synchronous method
-
-
-# Export provider and exporter accessors for advanced usage
-
-__all__ = [
-    "flush_tracing", "WithTracing",
-    "set_span_attribute", "set_span_name", "get_active_span",
-    "get_active_trace_id", "get_span_id", "create_span_from_trace_id", "inject_trace_context", "extract_trace_context",
-    "set_conversation_id", "set_component_tag", "set_token_usage", "set_provider_and_model", "get_span", "submit_feedback"
-]
+__all__ = ["WithTracing"]
 
 
 class TracingOptions:
@@ -73,20 +46,25 @@ class TracingOptions:
                 descriptive names.
             
             ignore_input: Iterable of keys (e.g., list, set) to exclude from
-                input data when recording span attributes. Only applies when
-                input is a dictionary. For example, use `["password", "api_key"]`
-                to exclude sensitive fields from being traced.
+                input data when recording span attributes. Applies after filter_input if both are set. 
+                Only applies when
+                input is a dictionary. Supports simple wildcards (e.g., `"_*"` 
+                matches `"_apple"`, `"_fruit"`). For example, use `["password", "api_key"]`
+                or `["_*", "password"]` to exclude sensitive fields from being traced.
             
             ignore_output: Iterable of keys (e.g., list, set) to exclude from
                 output data when recording span attributes. Only applies when
-                output is a dictionary. Useful for excluding large or sensitive
+                output is a dictionary. Supports simple wildcards (e.g., `"_*"` 
+                matches `"_apple"`, `"_fruit"`). Useful for excluding large or sensitive
                 fields from traces.
             
-            filter_input: Callable function that receives the prepared input data
-                and returns a filtered/transformed version to be recorded in the
-                span. The function should accept one argument (the input data)
-                and return the transformed data. This is applied before
-                ignore_input filtering.
+            filter_input: Callable function that receives the same arguments as the
+                decorated function (*args, **kwargs) and returns a filtered/transformed
+                version to be recorded in the span. This allows you to extract specific
+                properties from any kind of object, including `self` for methods.
+                The function receives the exact same inputs as the decorated function,
+                including `self` for bound methods. Returns a dict or any value that
+                will be converted to a dict. Applied before ignore_input filtering.
             
             filter_output: Callable function that receives the output data and
                 returns a filtered/transformed version to be recorded in the span.
@@ -107,12 +85,45 @@ class TracingOptions:
             )
             def process_data(items):
                 return items
+            
+            # Extract properties from self in a method
+            class ExperimentRunner:
+                def __init__(self, dataset_id, experiment_id):
+                    self.dataset_id = dataset_id
+                    self.experiment_id = experiment_id
+                
+                @WithTracing(
+                    filter_input=lambda self, example: {
+                        "dataset": self.dataset_id,
+                        "experiment": self.experiment_id,
+                        "example_id": example.id if hasattr(example, 'id') else None
+                    }
+                )
+                def run_example(self, example):
+                    return self.process(example)
         """
         self.name = name
         self.ignore_input = ignore_input
         self.ignore_output = ignore_output
         self.filter_input = filter_input
         self.filter_output = filter_output
+
+
+def _matches_ignore_pattern(key: str, ignore_patterns: List[str]) -> bool:
+    """
+    Check if a key matches any pattern in the ignore list.
+    Supports simple wildcards (e.g., "_*" matches "_apple", "_fruit").
+    """
+    for pattern in ignore_patterns:
+        if "*" in pattern or "?" in pattern:
+            # Use fnmatch for wildcard matching
+            if fnmatch.fnmatch(key, pattern):
+                return True
+        else:
+            # Exact match for non-wildcard patterns
+            if key == pattern:
+                return True
+    return False
 
 
 def _prepare_input(args: tuple, kwargs: dict, sig: Optional[inspect.Signature] = None) -> Any:
@@ -157,6 +168,33 @@ def _prepare_input(args: tuple, kwargs: dict, sig: Optional[inspect.Signature] =
     return result
 
 
+def _apply_ignore_patterns(data_dict: dict, ignore_patterns: Optional[List[str]]) -> dict:
+    """
+    Apply ignore patterns to a dict.
+    Supports string keys, wildcard patterns (*), and list of patterns.
+    Used for both ignore_input and ignore_output.
+    
+    Args:
+        data_dict: Dictionary to filter
+        ignore_patterns: List of patterns to exclude (e.g., ["self", "_*", "password"])
+    
+    Returns:
+        Filtered dictionary with matching keys removed
+    """
+    if not ignore_patterns or not isinstance(data_dict, dict):
+        return data_dict
+    
+    result = data_dict.copy()
+    keys_to_delete = [
+        key for key in result.keys()
+        if _matches_ignore_pattern(key, ignore_patterns)
+    ]
+    for key in keys_to_delete:
+        del result[key]
+    
+    return result
+
+
 def _prepare_and_filter_input(
     args: tuple,
     kwargs: dict,
@@ -165,44 +203,64 @@ def _prepare_and_filter_input(
     sig: Optional[inspect.Signature] = None,
 ) -> Any:
     """
-    Prepare and filter input for span attributes - applies the user's filter_input and ignore_input.
-    Converts all args to a dict using function signature when available.
+    Prepare and filter input for span attributes.
+    
+    Process flow:
+    1. Apply filter_input to args, kwargs (receives same inputs as decorated function, including self)
+    2. Convert into dict ready for span.attributes.input
+    3. Apply ignore_input to the dict (supports string, wildcard, and list patterns)
+    
+    Args:
+        args: Positional arguments (including self for bound methods)
+        kwargs: Keyword arguments
+        filter_input: Optional function to filter/transform args and kwargs before conversion.
+            Receives *args, **kwargs with the same signature as the function being decorated,
+            including `self` for bound methods. This allows extracting properties from any object.
+        ignore_input: Optional list of keys/patterns to exclude from the final dict.
+            If "self" is in ignore_input, it will be removed from the final dict but filter_input
+            still receives it.
+        sig: Optional function signature for proper arg name resolution
+    
+    Returns:
+        Prepared input data (dict, list, or other) ready for span.attributes.input
     """
-    # Handle "self" in ignore_input by skipping the first argument
-    filtered_args = args
-    filtered_kwargs = kwargs.copy() if kwargs else {}
-    filtered_ignore_input = ignore_input
-    filtered_sig = sig
-    if ignore_input and "self" in ignore_input:
-        # Remove "self" from ignore_input list (we'll handle it specially)
-        filtered_ignore_input = [key for key in ignore_input if key != "self"]
-        # Skip first arg if it exists (typically self for bound methods)
-        if args:
-            filtered_args = args[1:]
-        # Also remove "self" from kwargs if present
-        if "self" in filtered_kwargs:
-            del filtered_kwargs["self"]
-        # Adjust signature to remove "self" parameter if present
-        # This is needed because we removed self from args, so signature binding will fail otherwise
-        if filtered_sig is not None:
-            params = list(filtered_sig.parameters.values())
-            if params and params[0].name == "self":
-                filtered_sig = filtered_sig.replace(parameters=params[1:])
-    # turn args, kwargs into one "nice" object (now always a dict when signature is available)
-    input_data = _prepare_input(filtered_args, filtered_kwargs, filtered_sig)
-    if filter_input and input_data is not None:
-        input_data = filter_input(input_data)
-    if filtered_ignore_input and len(filtered_ignore_input) > 0:
-        if not isinstance(input_data, dict):
-            logger.warning(f"_prepare_and_filter_input: skip: ignore_input is set beyond 'self': {filtered_ignore_input} but input_data is not a dict: {type(input_data)}")
+    # Step 1: Apply filter_input to args, kwargs (same inputs as decorated function, including self)
+    if filter_input:
+        # filter_input receives the exact same args/kwargs as the decorated function
+        # This allows it to access self and extract properties from any object
+        try:
+            filtered_result = filter_input(*args, **kwargs)
+        except TypeError:
+            # Fallback: backward compatibility - convert to dict first
+            temp_dict = _prepare_input(args, kwargs, sig)
+            filtered_result = filter_input(temp_dict)
+        
+        # Step 2: Convert filter_input result into dict ready for span.attributes.input
+        if isinstance(filtered_result, dict):
+            input_data = filtered_result
         else:
-            for key in filtered_ignore_input:
-                if key in input_data:
-                    del input_data[key]
-    # Also handle case where input_data is just self (single value, not dict)
-    # If we filtered out self and there are no remaining args/kwargs, return None
-    if ignore_input and "self" in ignore_input and not filtered_args and not filtered_kwargs:
-        return None
+            # Convert filter_input result to dict using signature
+            # Use original sig (not filtered) since filter_input received all args including self
+            input_data = _prepare_input(
+                (filtered_result,) if not isinstance(filtered_result, tuple) else filtered_result,
+                {},
+                sig
+            )
+    else:
+        # Step 2: Convert into dict ready for span.attributes.input
+        input_data = _prepare_input(args, kwargs, sig)
+    
+    # Step 3: Apply ignore_input to the dict (removes "self" from final dict if specified)
+    should_ignore_self = ignore_input and "self" in ignore_input
+    if isinstance(input_data, dict):
+        input_data = _apply_ignore_patterns(input_data, ignore_input)
+        # Handle case where we removed self and there are no remaining args/kwargs
+        if should_ignore_self and not input_data:
+            return None
+    elif ignore_input:
+        # Warn if ignore_input is set but input_data is not a dict
+        logger.warning(f"_prepare_and_filter_input: skip: ignore_input is set but input_data is not a dict: {type(input_data)}")
+    
     return input_data
 
 
@@ -217,11 +275,13 @@ def _filter_and_serialize_output(
         if isinstance(output_data, dict):
             output_data = output_data.copy() # copy to provide shallow protection against the user accidentally mutating the output with filter_output
         output_data = filter_output(output_data)
-    if ignore_output and isinstance(output_data, dict):
-        output_data = output_data.copy()
-        for key in ignore_output:
-            if key in output_data:
-                del output_data[key]
+    
+    # Apply ignore_output patterns (supports key, wildcard, and list patterns)
+    if isinstance(output_data, dict):
+        output_data = _apply_ignore_patterns(output_data, ignore_output)
+    elif ignore_output:
+        # Warn if ignore_output is set but output_data is not a dict
+        logger.warning(f"_filter_and_serialize_output: skip: ignore_output is set but output_data is not a dict: {type(output_data)}")
     
     # Serialize immediately to create immutable result (removes mutable structures)
     return serialize_for_span(output_data)
@@ -438,13 +498,22 @@ def WithTracing(
         func: The function to trace (when used as @WithTracing)
         name: Optional custom name for the span (defaults to function name)
         ignore_input: List of keys to exclude from input data when recording span attributes.
-            Only applies when input is a dictionary. For example, use ["password", "api_key"]
-            to exclude sensitive fields from being traced.
+            self is handled as "self"
+            Supports simple wildcards (e.g., "_*" 
+            matches "_apple", "_fruit"). For example, use ["password", "api_key"] or 
+            ["_*", "password"] to exclude sensitive fields from being traced.
         ignore_output: List of keys to exclude from output data when recording span attributes.
-            Only applies when output is a dictionary. Useful for excluding large or sensitive
+            Only applies when output is a dictionary. Supports simple wildcards (e.g., "_*" 
+            matches "_apple", "_fruit"). Useful for excluding large or sensitive
             fields from traces.
-        filter_input: Function to filter/transform input before recording
-        filter_output: Function to filter/transform output before recording
+        filter_input: Function to filter/transform input before recording.
+            Receives the same arguments as the decorated function (*args, **kwargs),
+            including `self` for bound methods. This allows you to extract specific
+            properties from any kind of object. For example, to extract `dataset_id`
+            from `self` in a method: `filter_input=lambda self, x: {"dataset": self.dataset_id, "x": x}`.
+            Returns a dict or any value (will be converted to dict). Applied before ignore_input.
+        filter_output: Function to filter/transform output before recording.
+            Receives the output value and returns a filtered/transformed version.
     
     Example:
         @WithTracing
@@ -454,6 +523,17 @@ def WithTracing(
         @WithTracing(name="custom_name")
         def another_function():
             pass
+        
+        # Extract properties from self in a method
+        class MyClass:
+            def __init__(self, dataset_id):
+                self.dataset_id = dataset_id
+            
+            @WithTracing(
+                filter_input=lambda self, x: {"dataset": self.dataset_id, "x": x}
+            )
+            def process(self, x):
+                return x * 2
     """
     def decorator(fn: Callable) -> Callable:
         fn_name = name or fn.__name__ or "_"
@@ -677,476 +757,4 @@ def WithTracing(
         return decorator(func)
 
 
-def set_span_attribute(attribute_name: str, attribute_value: Any) -> bool:
-    """
-    Set an attribute on the active span.
-    
-    Returns:
-        True if attribute was set, False if no active span found
-    """
-    span = trace.get_current_span()
-    if span and span.is_recording():
-        span.set_attribute(attribute_name, serialize_for_span(attribute_value))
-        return True
-    return False
-
-def set_span_name(span_name: str) -> bool:
-    """
-    Set the name of the active span.
-    """
-    span = trace.get_current_span()
-    if span and span.is_recording():
-        span.update_name(span_name)
-        return True
-    return False
-
-def get_active_span() -> Optional[trace.Span]:
-    """Get the currently active span."""
-    return trace.get_current_span()
-
-
-def set_conversation_id(conversation_id: str) -> bool:
-    """
-    Naturally a conversation might span several traces. 
-    Set the gen_ai.conversation.id attribute on the active span.
-    This allows you to group multiple traces together that are part of the same conversation.
-    See https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-events/ for more details.
-    
-    Args:
-        conversation_id: A unique identifier for the conversation (e.g., user session ID, chat ID, etc.)
-    
-    Returns:
-        True if gen_ai.conversation.id was set, False if no active span found
-    
-    Example:
-        from aiqa import WithTracing, set_conversation_id
-        
-        @WithTracing
-        def handle_user_request(user_id: str, request: dict):
-            # Set conversation ID to group all traces for this user session
-            set_conversation_id(f"user_{user_id}_session_{request.get('session_id')}")
-            # ... rest of function
-    """
-    return set_span_attribute("gen_ai.conversation.id", conversation_id)
-
-
-def set_token_usage(
-    input_tokens: Optional[int] = None,
-    output_tokens: Optional[int] = None,
-    total_tokens: Optional[int] = None,
-) -> bool:
-    """
-    Set token usage attributes on the active span using OpenTelemetry semantic conventions for gen_ai.
-    This allows you to explicitly record token usage information.
-    AIQA tracing will automatically detect and set token usage from standard OpenAI-like API responses.
-    See https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ for more details.
-    
-    Args:
-        input_tokens: Number of input tokens used (maps to gen_ai.usage.input_tokens)
-        output_tokens: Number of output tokens generated (maps to gen_ai.usage.output_tokens)
-        total_tokens: Total number of tokens used (maps to gen_ai.usage.total_tokens)
-    
-    Returns:
-        True if at least one token usage attribute was set, False if no active span found
-    
-    Example:
-        from aiqa import WithTracing, set_token_usage
-        
-        @WithTracing
-        def call_llm(prompt: str):
-            response = openai_client.chat.completions.create(...)
-            # Explicitly set token usage
-            set_token_usage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens
-            )
-            return response
-    """
-    span = trace.get_current_span()
-    if not span or not span.is_recording():
-        return False
-    
-    set_count = 0
-    try:
-        if input_tokens is not None:
-            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-            set_count += 1
-        if output_tokens is not None:
-            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-            set_count += 1
-        if total_tokens is not None:
-            span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
-            set_count += 1
-    except Exception as e:
-        logger.warning(f"Failed to set token usage attributes: {e}")
-        return False
-    
-    return set_count > 0
-
-
-def set_provider_and_model(
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
-) -> bool:
-    """
-    Set provider and model attributes on the active span using OpenTelemetry semantic conventions for gen_ai.
-    This allows you to explicitly record provider and model information.
-    AIQA tracing will automatically detect and set provider/model from standard API responses.
-    See https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ for more details.
-    
-    Args:
-        provider: Name of the AI provider (e.g., "openai", "anthropic", "google") (maps to gen_ai.provider.name)
-        model: Name of the model used (e.g., "gpt-4", "claude-3-5-sonnet") (maps to gen_ai.request.model)
-    
-    Returns:
-        True if at least one attribute was set, False if no active span found
-    
-    Example:
-        from aiqa import WithTracing, set_provider_and_model
-        
-        @WithTracing
-        def call_llm(prompt: str):
-            response = openai_client.chat.completions.create(...)
-            # Explicitly set provider and model
-            set_provider_and_model(
-                provider="openai",
-                model=response.model
-            )
-            return response
-    """
-    span = trace.get_current_span()
-    if not span or not span.is_recording():
-        return False
-    
-    set_count = 0
-    try:
-        if provider is not None:
-            span.set_attribute("gen_ai.provider.name", str(provider))
-            set_count += 1
-        if model is not None:
-            span.set_attribute("gen_ai.request.model", str(model))
-            set_count += 1
-    except Exception as e:
-        logger.warning(f"Failed to set provider/model attributes: {e}")
-        return False
-    
-    return set_count > 0
-
-
-def set_component_tag(tag: str) -> None:
-    """
-    Set the component tag that will be added to all spans created by AIQA.
-    This can also be set via the AIQA_COMPONENT_TAG environment variable.
-    The component tag allows you to identify which component/system generated the spans.
-    
-    Note: Initialization is automatic when WithTracing is first used. You can also call
-    get_aiqa_client() explicitly if needed.
-    the client and load environment variables.
-    
-    Args:
-        tag: A component identifier (e.g., "mynamespace.mysystem", "backend.api", etc.)
-    
-    Example:
-        from aiqa import get_aiqa_client, set_component_tag, WithTracing
-        
-        # Initialize client (loads env vars including AIQA_COMPONENT_TAG)
-        get_aiqa_client()
-        
-        # Or set component tag programmatically (overrides env var)
-        set_component_tag("mynamespace.mysystem")
-        
-        @WithTracing
-        def my_function():
-            pass
-    """
-    _set_component_tag(tag)
-
-
-def get_active_trace_id() -> Optional[str]:
-    """
-    Get the current trace ID as a hexadecimal string (32 characters).
-    
-    Returns:
-        The trace ID as a hex string, or None if no active span exists.
-    
-    Example:
-        trace_id = get_active_trace_id()
-        # Pass trace_id to another service/agent
-        # e.g., include in HTTP headers, message queue metadata, etc.
-        # Within a single thread, OpenTelemetry normally does this for you.
-    """
-    span = trace.get_current_span()
-    if span and span.get_span_context().is_valid:
-        return format(span.get_span_context().trace_id, "032x")
-    return None
-
-
-def get_span_id() -> Optional[str]:
-    """
-    Get the current span ID as a hexadecimal string (16 characters).
-    
-    Returns:
-        The span ID as a hex string, or None if no active span exists.
-    
-    Example:
-        span_id = get_span_id()
-        # Can be used to create child spans in other services
-    """
-    span = trace.get_current_span()
-    if span and span.get_span_context().is_valid:
-        return format(span.get_span_context().span_id, "016x")
-    return None
-
-
-def create_span_from_trace_id(
-    trace_id: str,
-    parent_span_id: Optional[str] = None,
-    span_name: str = "continued_span",
-) -> trace.Span:
-    """
-    Create a new span that continues from an existing trace ID.
-    This is useful for linking traces across different services or agents.
-    
-    Args:
-        trace_id: The trace ID as a hexadecimal string (32 characters)
-        parent_span_id: Optional parent span ID as a hexadecimal string (16 characters).
-            If provided, the new span will be a child of this span.
-        span_name: Name for the new span (default: "continued_span")
-    
-    Returns:
-        A new span that continues the trace. Use it in a context manager or call end() manually.
-    
-    Example:
-        # In service A: get trace ID
-        trace_id = get_active_trace_id()
-        span_id = get_span_id()
-        
-        # Send to service B (e.g., via HTTP, message queue, etc.)
-        # ...
-        
-        # In service B: continue the trace
-        with create_span_from_trace_id(trace_id, parent_span_id=span_id, span_name="service_b_operation"):
-            # Your code here
-            pass
-    """
-    try:
-        # Parse trace ID from hex string
-        trace_id_int = int(trace_id, 16)
-        
-        # Parse parent span ID if provided
-        parent_span_id_int = None
-        if parent_span_id:
-            parent_span_id_int = int(parent_span_id, 16)
-        
-        # Create a parent span context
-        parent_span_context = SpanContext(
-            trace_id=trace_id_int,
-            span_id=parent_span_id_int if parent_span_id_int else 0,
-            is_remote=True,
-            trace_flags=TraceFlags(0x01),  # SAMPLED flag
-        )
-        
-        # Create a context with this span context as the parent
-        from opentelemetry.trace import set_span_in_context
-        parent_context = set_span_in_context(trace.NonRecordingSpan(parent_span_context))
-        
-        # Ensure initialization before creating span
-        get_aiqa_client()
-        # Start a new span in this context (it will be a child of the parent span)
-        tracer = get_aiqa_tracer()
-        span = tracer.start_span(span_name, context=parent_context)
-        
-        # Set component tag if configured
-        component_tag = get_component_tag()
-        if component_tag:
-            span.set_attribute("gen_ai.component.id", component_tag)
-        
-        return span
-    except (ValueError, AttributeError) as e:
-        logger.error(f"Error creating span from trace_id: {e}")
-        # Ensure initialization before creating span
-        get_aiqa_client()
-        # Fallback: create a new span
-        tracer = get_aiqa_tracer()
-        span = tracer.start_span(span_name)
-        component_tag = get_component_tag()
-        if component_tag:
-            span.set_attribute("gen_ai.component.id", component_tag)
-        return span
-
-
-def inject_trace_context(carrier: dict) -> None:
-    """
-    Inject the current trace context into a carrier (e.g., HTTP headers).
-    This allows you to pass trace context to another service.
-    
-    Args:
-        carrier: Dictionary to inject trace context into (e.g., HTTP headers dict)
-    
-    Example:
-        import requests
-        
-        headers = {}
-        inject_trace_context(headers)
-        response = requests.get("http://other-service/api", headers=headers)
-    """
-    try:
-        inject(carrier)
-    except Exception as e:
-        logger.warning(f"Error injecting trace context: {e}")
-
-
-def extract_trace_context(carrier: dict) -> Any:
-    """
-    Extract trace context from a carrier (e.g., HTTP headers).
-    Use this to continue a trace that was started in another service.
-    
-    Args:
-        carrier: Dictionary containing trace context (e.g., HTTP headers dict)
-    
-    Returns:
-        A context object that can be used with trace.use_span() or tracer.start_span()
-    
-    Example:
-        from opentelemetry.trace import use_span
-        
-        # Extract context from incoming request headers
-        ctx = extract_trace_context(request.headers)
-        
-        # Use the context to create a span
-        with use_span(ctx):
-            # Your code here
-            pass
-        
-        # Or create a span with the context
-        tracer = get_aiqa_tracer()
-        with tracer.start_as_current_span("operation", context=ctx):
-            # Your code here
-            pass
-    """
-    try:
-        return extract(carrier)
-    except Exception as e:
-        logger.warning(f"Error extracting trace context: {e}")
-        return None
-
-
-def get_span(span_id: str, organisation_id: Optional[str] = None, exclude: Optional[List[str]] = None) -> Optional[dict]:
-    """
-    Get a span by its ID from the AIQA server.
-    
-    Expected usage is: re-playing a specific function call in a unit test (either a developer debugging an issue, or as part of a test suite).
-    
-    Args:
-        span_id: The span ID as a hexadecimal string (16 characters) or client span ID
-        organisation_id: Optional organisation ID. If not provided, will try to get from
-            AIQA_ORGANISATION_ID environment variable. The organisation is typically
-            extracted from the API key during authentication, but the API requires it
-            as a query parameter.
-        exclude: Optional list of fields to exclude from the span data. By default this function WILL return 'attributes' (often large).
-    
-    Returns:
-        The span data as a dictionary, or None if not found
-    
-    Example:
-        from aiqa import get_span
-        
-        span = get_span('abc123...')
-        if span:
-            print(f"Found span: {span['name']}")
-            my_function(**span['input'])
-    """
-    server_url = get_server_url()
-    api_key = get_api_key()
-    org_id = organisation_id or os.getenv("AIQA_ORGANISATION_ID", "")
-    
-    # Check if server_url is the default (meaning AIQA_SERVER_URL was not set)
-    if not os.getenv("AIQA_SERVER_URL"):
-        raise ValueError("AIQA_SERVER_URL is not set. Cannot retrieve span.")    
-    if not org_id:
-        raise ValueError("Organisation ID is required. Provide it as parameter or set AIQA_ORGANISATION_ID environment variable.")
-    if not api_key:
-        raise ValueError("API key is required. Set AIQA_API_KEY environment variable.")
-    
-    # Try both spanId and clientSpanId queries
-    for query_field in ["spanId", "clientSpanId"]:
-        url = f"{server_url}/span"
-        params = {
-            "q": f"{query_field}:{span_id}",
-            "organisation": org_id,
-            "limit": "1",
-            "exclude": ",".join(exclude) if exclude else None,
-            "fields": "*" if not exclude else None,
-        }
-        
-        headers = build_headers(api_key)
-        
-        response = requests.get(url, params=params, headers=headers)
-        if response.status_code == 200:
-            result = response.json()
-            hits = result.get("hits", [])
-            if hits and len(hits) > 0:
-                return hits[0]
-        elif response.status_code == 404:
-            # Try next query field
-            continue
-        else:
-            error_text = response.text
-            raise ValueError(f"Failed to get span: {response.status_code} - {error_text[:500]}")        
-    # not found
-    return None
-
-
-async def submit_feedback(
-    trace_id: str,
-    thumbs_up: Optional[bool] = None,
-    comment: Optional[str] = None,
-) -> None:
-    """
-    Submit feedback for a trace by creating a new span with the same trace ID.
-    This allows you to add feedback (thumbs-up, thumbs-down, comment) to a trace after it has completed.
-    
-    Args:
-        trace_id: The trace ID as a hexadecimal string (32 characters)
-        thumbs_up: True for positive feedback, False for negative feedback, None for neutral
-        comment: Optional text comment
-    
-    Example:
-        from aiqa import submit_feedback
-        
-        # Submit positive feedback
-        await submit_feedback('abc123...', thumbs_up=True, comment='Great response!')
-        
-        # Submit negative feedback
-        await submit_feedback('abc123...', thumbs_up=False, comment='Incorrect answer')
-    """
-    if not trace_id or len(trace_id) != 32:
-        raise ValueError('Invalid trace ID: must be 32 hexadecimal characters')
-    
-    # Create a span for feedback with the same trace ID
-    span = create_span_from_trace_id(trace_id, span_name='feedback')
-    
-    try:
-        # Set feedback attributes
-        if thumbs_up is not None:
-            span.set_attribute('feedback.thumbs_up', thumbs_up)
-            span.set_attribute('feedback.type', 'positive' if thumbs_up else 'negative')
-        else:
-            span.set_attribute('feedback.type', 'neutral')
-        
-        if comment:
-            span.set_attribute('feedback.comment', comment)
-        
-        # Mark as feedback span
-        span.set_attribute('aiqa.span_type', 'feedback')
-        
-        # End the span
-        span.end()
-        
-        # Flush to ensure it's sent immediately
-        await flush_tracing()
-    except Exception as e:
-        span.end()
-        raise e
 

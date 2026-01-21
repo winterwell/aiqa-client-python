@@ -6,8 +6,9 @@ import os
 import inspect
 import pytest
 from unittest.mock import patch, MagicMock
-from aiqa.tracing import get_span
-from aiqa.tracing import _prepare_input, _prepare_and_filter_input
+from aiqa.span_helpers import get_span
+from aiqa.tracing import _prepare_input, _prepare_and_filter_input, _filter_and_serialize_output
+from aiqa.tracing import _matches_ignore_pattern
 
 
 class TestGetSpan:
@@ -371,21 +372,20 @@ class TestPrepareAndFilterInput:
         assert result["y"] == "hello"
 
     def test_ignore_self_with_no_self_in_signature(self):
-        """Test that ignore_input=['self'] removes first arg even if signature doesn't have self."""
-        # For bound methods or regular functions without self, signature doesn't include self
-        # But if user specifies ignore_input=['self'], we still remove first arg
+        """Test that ignore_input=['self'] removes 'self' key from final dict."""
+        # ignore_input=['self'] only affects the final dict, not the args passed to _prepare_input
         def test_func(x: int, y: str):
             pass
         
         sig = inspect.signature(test_func)
-        # Signature doesn't have 'self', but we still remove first arg
-        # Signature won't be adjusted (only adjusted if first param is 'self')
-        # So binding will fail and fall back to legacy behavior
+        # Signature doesn't have 'self', so binding works normally
         result = _prepare_and_filter_input((5, "hello"), {}, None, ["self"], sig)
         
-        # Binding fails because we removed first arg but signature wasn't adjusted
-        # Falls back to legacy: single arg returns as-is
-        assert result == "hello"  # Single remaining arg returned as-is
+        # Result should be a dict with x and y, but no 'self' key (which wasn't there anyway)
+        assert isinstance(result, dict)
+        assert result["x"] == 5
+        assert result["y"] == "hello"
+        assert "self" not in result
 
     def test_filter_input_applied(self):
         """Test that filter_input function is applied."""
@@ -411,3 +411,388 @@ class TestPrepareAndFilterInput:
             assert result == [5, 3]
             # Warning should be called because ignore_input is set but input_data is not a dict
             mock_warning.assert_called_once()
+
+
+class TestMatchesIgnorePattern:
+    """Tests for _matches_ignore_pattern function with wildcard support."""
+
+    def test_exact_match(self):
+        """Test that exact matches work."""
+        assert _matches_ignore_pattern("password", ["password"]) is True
+        assert _matches_ignore_pattern("api_key", ["password", "api_key"]) is True
+        assert _matches_ignore_pattern("other", ["password", "api_key"]) is False
+
+    def test_wildcard_prefix(self):
+        """Test that wildcard patterns like '_*' match keys starting with '_'."""
+        assert _matches_ignore_pattern("_apple", ["_*"]) is True
+        assert _matches_ignore_pattern("_fruit", ["_*"]) is True
+        assert _matches_ignore_pattern("_internal_data", ["_*"]) is True
+        assert _matches_ignore_pattern("apple", ["_*"]) is False
+        assert _matches_ignore_pattern("_", ["_*"]) is True
+
+    def test_wildcard_suffix(self):
+        """Test that wildcard patterns like '*_internal' match keys ending with '_internal'."""
+        assert _matches_ignore_pattern("data_internal", ["*_internal"]) is True
+        assert _matches_ignore_pattern("test_internal", ["*_internal"]) is True
+        assert _matches_ignore_pattern("internal", ["*_internal"]) is False
+
+    def test_wildcard_middle(self):
+        """Test that wildcard patterns with '*' in the middle work."""
+        assert _matches_ignore_pattern("test_internal_data", ["test_*_data"]) is True
+        assert _matches_ignore_pattern("test_secret_data", ["test_*_data"]) is True
+        assert _matches_ignore_pattern("test_data", ["test_*_data"]) is False
+
+    def test_multiple_patterns(self):
+        """Test that multiple patterns work together."""
+        patterns = ["password", "_*", "api_*"]
+        assert _matches_ignore_pattern("password", patterns) is True
+        assert _matches_ignore_pattern("_secret", patterns) is True
+        assert _matches_ignore_pattern("api_key", patterns) is True
+        assert _matches_ignore_pattern("public_data", patterns) is False
+
+    def test_question_mark_wildcard(self):
+        """Test that '?' wildcard matches single character."""
+        assert _matches_ignore_pattern("test1", ["test?"]) is True
+        assert _matches_ignore_pattern("test2", ["test?"]) is True
+        assert _matches_ignore_pattern("test", ["test?"]) is False
+        assert _matches_ignore_pattern("test12", ["test?"]) is False
+
+
+class TestWildcardIgnoreInput:
+    """Tests for wildcard support in ignore_input."""
+
+    def test_wildcard_ignore_input_with_signature(self):
+        """Test that wildcard patterns work in ignore_input."""
+        def test_func(x: int, _apple: str, _fruit: str, y: float):
+            pass
+        
+        sig = inspect.signature(test_func)
+        result = _prepare_and_filter_input((5, "red", "banana", 1.0), {}, None, ["_*"], sig)
+        
+        assert isinstance(result, dict)
+        assert "x" in result
+        assert "_apple" not in result  # filtered out by wildcard
+        assert "_fruit" not in result  # filtered out by wildcard
+        assert "y" in result
+
+    def test_wildcard_and_exact_match(self):
+        """Test that wildcard and exact matches can be combined."""
+        def test_func(x: int, _apple: str, password: str, y: float):
+            pass
+        
+        sig = inspect.signature(test_func)
+        result = _prepare_and_filter_input((5, "red", "secret", 1.0), {}, None, ["_*", "password"], sig)
+        
+        assert isinstance(result, dict)
+        assert "x" in result
+        assert "_apple" not in result  # filtered out by wildcard
+        assert "password" not in result  # filtered out by exact match
+        assert "y" in result
+
+    def test_wildcard_no_match(self):
+        """Test that keys not matching wildcard are preserved."""
+        def test_func(x: int, apple: str, _secret: str, y: float):
+            pass
+        
+        sig = inspect.signature(test_func)
+        result = _prepare_and_filter_input((5, "red", "hidden", 1.0), {}, None, ["_*"], sig)
+        
+        assert isinstance(result, dict)
+        assert "x" in result
+        assert "apple" in result  # not filtered (doesn't start with _)
+        assert "_secret" not in result  # filtered out by wildcard
+        assert "y" in result
+
+
+class TestWildcardIgnoreOutput:
+    """Tests for wildcard support in ignore_output."""
+
+    def test_wildcard_ignore_output(self):
+        """Test that wildcard patterns work in ignore_output."""
+        output_data = {
+            "result": "success",
+            "_apple": "red",
+            "_fruit": "banana",
+            "public": "data"
+        }
+        
+        result = _filter_and_serialize_output(output_data, None, ["_*"])
+        
+        # Result is serialized to JSON string for dicts
+        assert isinstance(result, str)
+        
+        # Parse it back to verify filtering worked
+        import json
+        parsed = json.loads(result)
+        assert "_apple" not in parsed
+        assert "_fruit" not in parsed
+        assert "result" in parsed
+        assert "public" in parsed
+
+    def test_wildcard_and_exact_match_output(self):
+        """Test that wildcard and exact matches can be combined in ignore_output."""
+        output_data = {
+            "result": "success",
+            "_apple": "red",
+            "password": "secret",
+            "public": "data"
+        }
+        
+        result = _filter_and_serialize_output(output_data, None, ["_*", "password"])
+        
+        import json
+        parsed = json.loads(result)
+        assert "_apple" not in parsed
+        assert "password" not in parsed
+        assert "result" in parsed
+        assert "public" in parsed
+
+    def test_wildcard_no_match_output(self):
+        """Test that keys not matching wildcard are preserved in output."""
+        output_data = {
+            "result": "success",
+            "apple": "red",
+            "_secret": "hidden",
+            "public": "data"
+        }
+        
+        result = _filter_and_serialize_output(output_data, None, ["_*"])
+        
+        import json
+        parsed = json.loads(result)
+        assert "apple" in parsed  # not filtered
+        assert "_secret" not in parsed  # filtered by wildcard
+        assert "result" in parsed
+        assert "public" in parsed
+
+
+class TestWithTracingFilterInput:
+    """Tests for WithTracing filter_input functionality."""
+
+    def test_filter_input_with_self_extracts_properties(self):
+        """Test filter_input receives self and can extract specific properties."""
+        from aiqa import WithTracing
+        
+        class TestClass:
+            def __init__(self):
+                self.trace_me_id = "dataset-123"
+                self._trace_me_not = "secret-data"
+            
+            @WithTracing(
+                filter_input=lambda self, x: {"dataset_id": self.trace_me_id, "x": x}
+            )
+            def my_method(self, x):
+                return x * 2
+        
+        obj = TestClass()
+        result = obj.my_method(5)
+        assert result == 10
+
+    def test_filter_input_with_positional_args(self):
+        """Test filter_input with positional arguments."""
+        from aiqa import WithTracing
+        
+        @WithTracing(
+            filter_input=lambda arg1, arg2: {"a": arg1, "b": arg2}
+        )
+        def my_function(arg1, arg2):
+            return arg1 + arg2
+        
+        result = my_function(1, 2)
+        assert result == 3
+
+    def test_filter_input_with_keyword_args(self):
+        """Test filter_input with keyword arguments."""
+        from aiqa import WithTracing
+        
+        @WithTracing(
+            filter_input=lambda arg1, arg2: {"a": arg1, "b": arg2}
+        )
+        def my_function(arg1, arg2):
+            return arg1 + arg2
+        
+        result = my_function(arg1=1, arg2=2)
+        assert result == 3
+
+    def test_ignore_input_self_removes_from_final_dict(self):
+        """Test ignore_input=['self'] removes self from final dict."""
+        from aiqa import WithTracing
+        from unittest.mock import patch, MagicMock
+        
+        class TestClass:
+            def __init__(self):
+                self.dataset_id = "ds-123"
+            
+            @WithTracing(ignore_input=["self"])
+            def my_method(self, x):
+                return x * 2
+        
+        obj = TestClass()
+        # Mock the client and tracer to capture what gets set
+        mock_client = MagicMock()
+        mock_client.enabled = True
+        with patch('aiqa.tracing.get_aiqa_client', return_value=mock_client):
+            with patch('aiqa.tracing.get_aiqa_tracer') as mock_tracer:
+                mock_span = MagicMock()
+                mock_span.is_recording.return_value = True
+                mock_span.get_span_context.return_value.trace_id = 123
+                mock_tracer.return_value.start_as_current_span.return_value.__enter__.return_value = mock_span
+                
+                obj.my_method(5)
+                
+                # Check that input was set
+                assert mock_span.set_attribute.called
+                # Find the input call
+                input_calls = [c for c in mock_span.set_attribute.call_args_list if c[0][0] == "input"]
+                assert len(input_calls) > 0
+                # The input should not contain "self"
+                # Note: input is serialized, so we check the call was made
+                # The actual filtering happens in _prepare_and_filter_input which is tested separately
+
+    def test_ignore_input_multiple_patterns(self):
+        """Test ignore_input with multiple patterns including wildcard."""
+        from aiqa import WithTracing
+        from unittest.mock import patch, MagicMock
+        
+        @WithTracing(ignore_input=["arg1", "_*"])
+        def my_function(arg1, arg2, _trace_me_not, trace_me_yes):
+            return arg1 + arg2
+        
+        mock_client = MagicMock()
+        mock_client.enabled = True
+        with patch('aiqa.tracing.get_aiqa_client', return_value=mock_client):
+            with patch('aiqa.tracing.get_aiqa_tracer') as mock_tracer:
+                mock_span = MagicMock()
+                mock_span.is_recording.return_value = True
+                mock_span.get_span_context.return_value.trace_id = 123
+                mock_tracer.return_value.start_as_current_span.return_value.__enter__.return_value = mock_span
+                
+                my_function(1, 2, _trace_me_not="hidden", trace_me_yes="visible")
+                
+                # Verify span was created and input was set
+                assert mock_span.set_attribute.called
+
+
+class TestFilterInputWithSelf:
+    """Tests for filter_input receiving self parameter."""
+
+    def test_filter_input_receives_self(self):
+        """Test that filter_input receives self as first parameter."""
+        from aiqa.tracing import _prepare_and_filter_input
+        import inspect
+        
+        class TestClass:
+            def __init__(self):
+                self.trace_me_id = "dataset-123"
+                self._trace_me_not = "secret"
+            
+            def my_method(self, x):
+                pass
+        
+        obj = TestClass()
+        sig = inspect.signature(obj.my_method)
+        
+        # filter_input should receive self and x
+        filter_fn = lambda self, x: {"dataset": self.trace_me_id, "x": x}
+        result = _prepare_and_filter_input((obj, 5), {}, filter_fn, None, sig)
+        
+        assert isinstance(result, dict)
+        assert result["dataset"] == "dataset-123"
+        assert result["x"] == 5
+        # _trace_me_not should not be in result (filter_input didn't include it)
+        assert "_trace_me_not" not in result
+
+    def test_filter_input_with_self_and_ignore_self(self):
+        """Test filter_input receives self even when ignore_input=['self']."""
+        from aiqa.tracing import _prepare_and_filter_input
+        import inspect
+        
+        class TestClass:
+            def __init__(self):
+                self.trace_me_id = "dataset-123"
+            
+            def my_method(self, x):
+                pass
+        
+        obj = TestClass()
+        sig = inspect.signature(obj.my_method)
+        
+        # filter_input should receive self, ignore_input removes it from final dict
+        filter_fn = lambda self, x: {"dataset": self.trace_me_id, "x": x}
+        result = _prepare_and_filter_input((obj, 5), {}, filter_fn, ["self"], sig)
+        
+        assert isinstance(result, dict)
+        assert result["dataset"] == "dataset-123"
+        assert result["x"] == 5
+        assert "self" not in result  # Removed by ignore_input
+
+    def test_filter_input_positional_args(self):
+        """Test filter_input with positional args."""
+        from aiqa.tracing import _prepare_and_filter_input
+        import inspect
+        
+        def my_function(arg1, arg2):
+            pass
+        
+        sig = inspect.signature(my_function)
+        filter_fn = lambda arg1, arg2: {"a": arg1, "b": arg2}
+        result = _prepare_and_filter_input((1, 2), {}, filter_fn, None, sig)
+        
+        assert result == {"a": 1, "b": 2}
+
+    def test_filter_input_keyword_args(self):
+        """Test filter_input with keyword args."""
+        from aiqa.tracing import _prepare_and_filter_input
+        import inspect
+        
+        def my_function(arg1, arg2):
+            pass
+        
+        sig = inspect.signature(my_function)
+        filter_fn = lambda arg1, arg2: {"a": arg1, "b": arg2}
+        result = _prepare_and_filter_input((), {"arg1": 1, "arg2": 2}, filter_fn, None, sig)
+        
+        assert result == {"a": 1, "b": 2}
+
+    def test_ignore_input_self_only(self):
+        """Test ignore_input=['self'] removes self from final dict."""
+        from aiqa.tracing import _prepare_and_filter_input
+        import inspect
+        
+        class TestClass:
+            def my_method(self, x):
+                pass
+        
+        obj = TestClass()
+        # Use unbound method to get signature with self
+        sig = inspect.signature(TestClass.my_method)
+        result = _prepare_and_filter_input((obj, 5), {}, None, ["self"], sig)
+        
+        # _prepare_input should bind args to signature, creating dict with self and x
+        # Then ignore_input removes "self" from the dict
+        assert isinstance(result, dict)
+        assert "self" not in result  # Removed by ignore_input
+        assert result["x"] == 5
+
+    def test_ignore_input_multiple_patterns(self):
+        """Test ignore_input with multiple patterns."""
+        from aiqa.tracing import _prepare_and_filter_input
+        import inspect
+        
+        def my_function(arg1, arg2, _trace_me_not, trace_me_yes):
+            pass
+        
+        sig = inspect.signature(my_function)
+        result = _prepare_and_filter_input(
+            (1, 2, "hidden", "visible"), 
+            {}, 
+            None, 
+            ["arg1", "_*"], 
+            sig
+        )
+        
+        assert isinstance(result, dict)
+        assert "arg1" not in result  # filtered by exact match
+        assert "_trace_me_not" not in result  # filtered by wildcard
+        assert "arg2" in result
+        assert "trace_me_yes" in result
