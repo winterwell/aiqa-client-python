@@ -222,7 +222,9 @@ class ExperimentRunner:
         # Do we have an experiment ID? If not, we need to create the experiment first
         if not self.experiment_id:
             self.create_experiment()
-
+        example_id = example.get("id")
+        if not example_id:
+            raise ValueError("Example must have an 'id' field")
         if result is None:
             example_id = example.get("id")
             if not example_id:
@@ -230,9 +232,7 @@ class ExperimentRunner:
             result = Result(exampleId=example_id, scores={}, messages={}, errors={})
         scores = result.get("scores") or {}
 
-        example_id = example.get("id")
-        if not example_id:
-            raise ValueError("Example must have an 'id' field")
+        
         
         print(f"Scoring and storing example: {example_id}")
         print(f"Scores: {scores}")
@@ -428,6 +428,9 @@ class ExperimentRunner:
         Returns:
             Dictionary of metric names to summary statistics
         """
+        if not self.experiment_id:
+            raise ValueError("No experiment ID available. Create an experiment first.")
+        
         response = requests.get(
             f"{self.server_url}/experiment/{self.experiment_id}",
             headers=self._get_headers(),

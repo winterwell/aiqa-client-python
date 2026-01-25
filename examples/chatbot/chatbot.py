@@ -18,12 +18,13 @@ sys.path.insert(0, str(parent_dir))
 
 from aiqa import WithTracing, get_aiqa_client
 
+import weave
+
 # Load environment variables from parent directory .env file
 env_path = parent_dir / ".env"
 load_dotenv(dotenv_path=env_path)
 
-# Initialize AIQA client for tracing
-get_aiqa_client()
+weave.init('example-chatbot')
 
 # Initialize OpenAI client
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -36,6 +37,7 @@ client = OpenAI(api_key=openai_api_key)
 
 
 @WithTracing
+@weave.op()
 def web_search(query: str) -> str:
     """
     Web search function using DuckDuckGo search.
@@ -93,6 +95,7 @@ def get_tools() -> List[Dict[str, Any]]:
 
 
 @WithTracing
+@weave.op()
 def call_openai(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]], model: str = "gpt-4o-mini") -> Any:
     """Call OpenAI API with the given messages and tools."""
     print(f"    ...calling OpenAI...")
@@ -105,6 +108,7 @@ def call_openai(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]], mod
 
 
 @WithTracing
+@weave.op()
 def handle_tool_call(tool_call: Any, messages: List[Dict[str, Any]]) -> str:
     """Handle a single tool call and return the result."""
     function_name = tool_call.function.name
@@ -119,6 +123,7 @@ def handle_tool_call(tool_call: Any, messages: List[Dict[str, Any]]) -> str:
 
 
 @WithTracing
+@weave.op()
 def process_tool_calls(
     tool_calls: List[Any], messages: List[Dict[str, Any]], tools: List[Dict[str, Any]], model: str = "gpt-4o-mini"
 ) -> Any:
@@ -145,6 +150,7 @@ def process_tool_calls(
 
 
 @WithTracing
+@weave.op()
 def process_user_input(
     user_input: str, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]], model: str = "gpt-4o-mini"
 ) -> str:

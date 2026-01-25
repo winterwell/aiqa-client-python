@@ -72,6 +72,7 @@ async def call_openai(
 ) -> str:
     """Call OpenAI API for LLM-as-judge scoring. Returns raw content string."""
     def _do_request():
+        # TODO send output_schema if provided
         return requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={
@@ -98,7 +99,10 @@ async def call_openai(
         )
 
     data = response.json()
-    content = data.get("choices", [{}])[0].get("message", {}).get("content")
+    choices = data.get("choices", [])
+    if not choices or not isinstance(choices, list):
+        raise Exception("OpenAI API did not return choices")
+    content = choices[0].get("message", {}).get("content")
     if not content:
         raise Exception("OpenAI API did not return content")
 
@@ -136,7 +140,10 @@ async def call_anthropic(
         )
 
     data = response.json()
-    content = data.get("content", [{}])[0].get("text", "")
+    content_list = data.get("content", [])
+    if not content_list or not isinstance(content_list, list):
+        raise Exception("Anthropic API did not return content")
+    content = content_list[0].get("text", "")
     if not content:
         raise Exception("Anthropic API did not return content")
 
