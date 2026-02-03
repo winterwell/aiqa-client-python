@@ -25,7 +25,7 @@ def sanitize_string_for_utf8(text: str) -> str:
     Returns:
         A string with surrogate characters replaced by the Unicode replacement character (U+FFFD)
     """
-    if text == None:
+    if text is None:
         return None
     if not isinstance(text, str): # paranoia
         text = str(text)
@@ -43,7 +43,10 @@ def toNumber(value: str|int|None) -> int:
     if value is None:
         return 0
     if isinstance(value, int):
-        return value    
+        return value
+    # Convert to string if not already
+    if not isinstance(value, str):
+        value = str(value)
     if value.endswith("b"): # drop the b
         value = value[:-1]
     if value.endswith("g"):

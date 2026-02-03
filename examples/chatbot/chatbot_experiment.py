@@ -237,10 +237,10 @@ async def main():
             print(f"Error processing example {example.get('id', 'unknown')}: {e}")
             # Continue with next example instead of failing entire run
     
-    # Get summary results
+    # Get summaries
     print("\nFetching summary results...")
-    summary_results = experiment_runner.get_summary_results()
-    print(f"Summary results: {summary_results}")
+    summaries = experiment_runner.get_summaries()
+    print(f"Summaries: {summaries}")
 
 
 if __name__ == "__main__":

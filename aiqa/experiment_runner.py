@@ -123,7 +123,17 @@ class ExperimentRunner:
         
         return dataset
 
-    def get_example_inputs(self, limit: int = 10000) -> List[Dict[str, Any]]:
+    def get_example(self, example_id: str) -> Dict[str, Any]:
+        """
+        Fetch an example by ID.
+        """
+        response = requests.get(
+            f"{self.server_url}/example/{example_id}",
+            headers=self._get_headers(),
+        )
+        return response.json()
+
+    def get_examples_for_dataset(self, limit: int = 10000) -> List[Dict[str, Any]]:
         """
         Fetch example inputs from the dataset.
 
@@ -162,7 +172,6 @@ class ExperimentRunner:
             experiment_setup: Optional setup for the experiment object. You may wish to set:
                 - name (recommended for labelling the experiment)
                 - parameters
-                - comparison_parameters
 
         Returns:
             The created experiment object
@@ -184,7 +193,7 @@ class ExperimentRunner:
             "organisation": self.organisation,
             "dataset": self.dataset_id,
             "results": [],
-            "summary_results": {},
+            "summaries": {},
         }
 
         print(f"Creating experiment")
@@ -226,10 +235,7 @@ class ExperimentRunner:
         if not example_id:
             raise ValueError("Example must have an 'id' field")
         if result is None:
-            example_id = example.get("id")
-            if not example_id:
-                raise ValueError("Example must have an 'id' field")
-            result = Result(exampleId=example_id, scores={}, messages={}, errors={})
+            result = Result(example=example_id, scores={}, messages={}, errors={})
         scores = result.get("scores") or {}
 
         
@@ -243,7 +249,7 @@ class ExperimentRunner:
                 f"{self.server_url}/experiment/{self.experiment_id}/example/{example_id}/scoreAndStore",
                 json={
                     "output": result,
-                    "traceId": example.get("traceId"),
+                    "traceId": example.get("trace"),  # Server returns 'trace' (lowercase), but API expects 'traceId' (camelCase)
                     "scores": scores,
                 },
                 headers=self._get_headers(),
@@ -271,7 +277,7 @@ class ExperimentRunner:
             engine: Function that takes input, returns output (can be async)
             scorer: Optional function that scores the output given the example
         """
-        examples = self.get_example_inputs()
+        examples = self.get_examples_for_dataset()
 
         # Wrap engine to match run_example signature (input, parameters)
         async def wrapped_engine(input_data, parameters):
@@ -304,8 +310,7 @@ class ExperimentRunner:
         scorer_for_metric_id: Optional[Dict[str, ScoreThisInputOutputMetricType]] = None,
     ) -> List[Result]:
         """
-        Run the engine on an example with the given parameters (looping over comparison parameters),
-        and score the result. Also calls scoreAndStore to store the result in the server.
+        Run the engine on an example with the experiment's parameters, score the result, and store it.
 
         Args:
             example: The example to run. See Example.ts type
@@ -313,117 +318,76 @@ class ExperimentRunner:
             scorer_for_metric_id: Optional dictionary of metric IDs to functions that score the output given the example and parameters
 
         Returns:
-            One set of scores for each comparison parameter set. If no comparison parameters,
-            returns an array of one.
+            List of one result (for API compatibility).
         """
-        # Ensure experiment exists
         if not self.experiment:
             self.create_experiment()
         if not self.experiment:
             raise Exception("Failed to create experiment")
 
-        # Make the parameters
-        parameters_fixed = self.experiment.get("parameters") or {}
-        # If comparison_parameters is empty/undefined, default to [{}] so we run at least once
-        parameters_loop = self.experiment.get("comparison_parameters") or [{}]
-
-        # Handle both spans array and input field
+        parameters_here = self.experiment.get("parameters") or {}
         input_data = example.get("input")
         if not input_data and example.get("spans") and len(example["spans"]) > 0:
             input_data = example["spans"][0].get("attributes", {}).get("input")
-
         if not input_data:
-            print(f"Warning: Example has no input field or spans with input attribute: {example}"
-            )
-            # Run engine anyway -- this could make sense if it's all about the parameters
+            print(f"Warning: Example has no input field or spans with input attribute: {example}")
 
-        # Set example.id on the root span (created by @WithTracing decorator)
-        # This ensures the root span from the trace has example=Example.id set
         example_id = example.get("id")
         if not example_id:
             raise ValueError("Example must have an 'id' field")
         set_span_attribute("example", example_id)
-        
-        all_scores: List[Dict[str, Any]] = []
-        dataset_metrics = self.get_dataset().get("metrics", [])
-        specific_metrics = example.get("metrics", [])
-        metrics = [*dataset_metrics, *specific_metrics]
-        # This loop should not be parallelized - it should run sequentially, one after the other
-        # to avoid creating interference between the runs.
-        for parameters in parameters_loop:
-            parameters_here = {**parameters_fixed, **parameters}
-            print(f"Running with parameters: {parameters_here}")
 
-            # Save original env var values for cleanup
-            original_env_vars: Dict[str, Optional[str]] = {}
-            # Set env vars from parameters_here
-            for key, value in parameters_here.items():
-                if value:
-                    original_env_vars[key] = os.environ.get(key)
-                    os.environ[key] = str(value)
+        print(f"Running with parameters: {parameters_here}")
+        original_env_vars: Dict[str, Optional[str]] = {}
+        for key, value in parameters_here.items():
+            if value:
+                original_env_vars[key] = os.environ.get(key)
+                os.environ[key] = str(value)
+        try:
+            start = time.time() * 1000
+            output = call_my_code(input_data, parameters_here)
+            if hasattr(output, "__await__"):
+                output = await output
+            duration = int((time.time() * 1000) - start)
+            print(f"Output: {output}")
 
-            try:
-                start = time.time() * 1000  # milliseconds
-                output = call_my_code(input_data, parameters_here)
-                # Handle async functions
-                if hasattr(output, "__await__"):
-                    output = await output
-                end = time.time() * 1000  # milliseconds
-                duration = int(end - start)
+            dataset_metrics = self.get_dataset().get("metrics", [])
+            specific_metrics = example.get("metrics", [])
+            metrics = [*dataset_metrics, *specific_metrics]
+            result = Result(example=example_id, scores={}, messages={}, errors={})
+            for metric in metrics:
+                metric_id = metric.get("id")
+                if not metric_id:
+                    continue
+                scorer = scorer_for_metric_id.get(metric_id) if scorer_for_metric_id else None
+                if scorer:
+                    metric_result = await scorer(input_data, output, metric)
+                elif metric.get("type") == "llm":
+                    metric_result = await self._score_llm_metric(input_data, output, example, metric)
+                else:
+                    continue
+                if not metric_result:
+                    result["errors"][metric_id] = "Scoring function returned None"
+                    continue
+                result["scores"][metric_id] = metric_result.get("score")
+                result["messages"][metric_id] = metric_result.get("message")
+                result["errors"][metric_id] = metric_result.get("error")
+            result["scores"]["duration"] = duration
+            await flush_tracing()
+            print(f"Call scoreAndStore ... for example: {example_id} with scores: {result['scores']}")
+            result = await self.score_and_store(example, output, result)
+            print(f"scoreAndStore returned: {result}")
+            return [result]
+        finally:
+            for key, original_value in original_env_vars.items():
+                if original_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = original_value
 
-                print(f"Output: {output}")
-                # Score it
-                result = Result(exampleId=example_id, scores={}, messages={}, errors={})
-                for metric in metrics:
-                    metric_id = metric.get("id")
-                    if not metric_id:
-                        print(f"Warning: Metric missing 'id' field, skipping: {metric}")
-                        continue
-                    scorer = scorer_for_metric_id.get(metric_id) if scorer_for_metric_id else None
-                    if scorer:
-                        metric_result = await scorer(input_data, output, metric)
-                    elif metric.get("type") == "llm":
-                        metric_result = await self._score_llm_metric(input_data, output, example, metric)
-                    else:
-                        metric_type = metric.get("type", "unknown")
-                        print(f"Skipping metric: {metric_id} {metric_type} - no scorer")
-                        continue
-                    
-                    # Handle None metric_result (e.g., if scoring failed)
-                    if not metric_result:
-                        print(f"Warning: Metric {metric_id} returned None result, skipping")
-                        result["errors"][metric_id] = "Scoring function returned None"
-                        continue
-                    
-                    result["scores"][metric_id] = metric_result.get("score")
-                    result["messages"][metric_id] = metric_result.get("message")
-                    result["errors"][metric_id] = metric_result.get("error")
-                # Always add duration to scores as a system metric
-                result["scores"]["duration"] = duration
-
-                # Flush spans before scoreAndStore to ensure they're indexed in ES
-                # This prevents race condition where scoreAndStore looks up spans before they're indexed
-                await flush_tracing()
-
-                print(f"Call scoreAndStore ... for example: {example_id} with scores: {result['scores']}")
-                result = await self.score_and_store(example, output, result)
-                print(f"scoreAndStore returned: {result}")
-                all_scores.append(result)
-            finally:
-                # Restore original env var values
-                for key, original_value in original_env_vars.items():
-                    if original_value is None:
-                        # Variable didn't exist before, remove it
-                        os.environ.pop(key, None)
-                    else:
-                        # Restore original value
-                        os.environ[key] = original_value
-
-        return all_scores
-
-    def get_summary_results(self) -> Dict[str, Any]:
+    def get_summaries(self) -> Dict[str, Any]:
         """
-        Get summary results from the experiment.
+        Get summaries from the experiment.
 
         Returns:
             Dictionary of metric names to summary statistics
@@ -435,12 +399,12 @@ class ExperimentRunner:
             f"{self.server_url}/experiment/{self.experiment_id}",
             headers=self._get_headers(),
         )
-
+    
         if not response.ok:
             raise Exception(format_http_error(response, "fetch summary results"))
 
         experiment2 = response.json()
-        return experiment2.get("summary_results", {})
+        return experiment2.get("summaries", {})
 
     async def _score_llm_metric(
         self,
@@ -471,7 +435,8 @@ class ExperimentRunner:
                 model_id, self.server_url, self._get_headers()
             )
             if model_data:
-                api_key = model_data.get("api_key")
+                # Server returns 'apiKey' (camelCase)
+                api_key = model_data.get("apiKey")
                 # If provider not set in metric, try to get it from model
                 if not provider and model_data.get("provider"):
                     provider = model_data.get("provider")

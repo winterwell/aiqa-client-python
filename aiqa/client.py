@@ -2,10 +2,10 @@
 import os
 import logging
 from functools import lru_cache
-from typing import Optional, TYPE_CHECKING, Any, Dict
+from typing import Optional, TYPE_CHECKING, Any, Dict, List
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, SpanExportResult, SpanExporter as SpanExporterBase
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import SpanContext
@@ -52,6 +52,8 @@ class AIQAClient:
             cls._instance._exporter = None # reduce circular import issues by not importing for typecheck here
             cls._instance._enabled: bool = True
             cls._instance._initialized: bool = False
+            cls._instance._default_ignore_patterns: List[str] = ["_*"]  # Default: filter properties starting with '_'
+            cls._instance._ignore_recursive: bool = True  # Default: recursive filtering enabled
         return cls._instance
     
     @property
@@ -89,6 +91,76 @@ class AIQAClient:
         """
         logger.info(f"AIQA tracing {'enabled' if value else 'disabled'}")
         self._enabled = value
+    
+    @property
+    def default_ignore_patterns(self) -> List[str]:
+        """
+        Get the default ignore patterns applied to all traced inputs and outputs.
+        
+        Default: ["_*"] (filters properties starting with '_')
+        
+        Returns:
+            List of ignore patterns (supports wildcards like "_*")
+        """
+        return self._default_ignore_patterns.copy()
+    
+    @default_ignore_patterns.setter
+    def default_ignore_patterns(self, value: Optional[List[str]]) -> None:
+        """
+        Set the default ignore patterns applied to all traced inputs and outputs.
+        
+        Args:
+            value: List of patterns to ignore (e.g., ["_*", "password"]).
+                   Set to None or [] to disable default ignore patterns.
+                   Supports wildcards (e.g., "_*" matches "_apple", "_fruit").
+        
+        Example:
+            from aiqa import get_aiqa_client
+            
+            client = get_aiqa_client()
+            # Add password to default ignore patterns
+            client.default_ignore_patterns = ["_*", "password", "api_key"]
+            # Disable default ignore patterns
+            client.default_ignore_patterns = []
+        """
+        if value is None:
+            self._default_ignore_patterns = []
+        else:
+            self._default_ignore_patterns = list(value)
+        logger.info(f"Default ignore patterns set to: {self._default_ignore_patterns}")
+    
+    @property
+    def ignore_recursive(self) -> bool:
+        """
+        Get whether ignore patterns are applied recursively to nested objects.
+        
+        Default: True (recursive filtering enabled)
+        
+        Returns:
+            True if recursive filtering is enabled, False otherwise
+        """
+        return self._ignore_recursive
+    
+    @ignore_recursive.setter
+    def ignore_recursive(self, value: bool) -> None:
+        """
+        Set whether ignore patterns are applied recursively to nested objects.
+        
+        When True (default), ignore patterns are applied at all nesting levels.
+        When False, ignore patterns are only applied to top-level keys.
+        
+        Args:
+            value: True to enable recursive filtering, False to disable
+        
+        Example:
+            from aiqa import get_aiqa_client
+            
+            client = get_aiqa_client()
+            # Disable recursive filtering (only filter top-level keys)
+            client.ignore_recursive = False
+        """
+        self._ignore_recursive = bool(value)
+        logger.info(f"Ignore recursive filtering {'enabled' if self._ignore_recursive else 'disabled'}")
     
     def shutdown(self) -> None:
         """
@@ -245,8 +317,6 @@ def _attach_aiqa_processor(provider: TracerProvider) -> None:
         auth_headers = {}
         if api_key:
             auth_headers["Authorization"] = f"ApiKey {api_key}"
-        elif os.getenv("AIQA_API_KEY"):
-            auth_headers["Authorization"] = f"ApiKey {os.getenv('AIQA_API_KEY')}"
         
         # OTLP HTTP exporter requires the full endpoint URL including /v1/traces
         # Ensure server_url doesn't have trailing slash or /v1/traces, then append /v1/traces

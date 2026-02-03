@@ -8,7 +8,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 from aiqa.span_helpers import get_span
 from aiqa.tracing import _prepare_input, _prepare_and_filter_input, _filter_and_serialize_output
-from aiqa.tracing import _matches_ignore_pattern
+from aiqa.tracing import _matches_ignore_pattern, _apply_ignore_patterns, _merge_with_default_ignore_patterns
 
 
 class TestGetSpan:
@@ -796,3 +796,367 @@ class TestFilterInputWithSelf:
         assert "_trace_me_not" not in result  # filtered by wildcard
         assert "arg2" in result
         assert "trace_me_yes" in result
+
+
+class TestDefaultUnderscoreIgnore:
+    """Tests for default '_*' pattern that filters properties starting with '_'."""
+
+    def test_default_underscore_ignore_input(self):
+        """Test that '_*' pattern is applied by default to ignore_input."""
+        def test_func(user: dict, x: int):
+            pass
+        
+        sig = inspect.signature(test_func)
+        user_data = {"name": "Alice", "_sa_instance_state": "object"}
+        result = _prepare_and_filter_input((user_data, 5), {}, None, None, sig)
+        
+        assert isinstance(result, dict)
+        assert "user" in result
+        user_result = result["user"]
+        assert isinstance(user_result, dict)
+        assert "name" in user_result
+        assert user_result["name"] == "Alice"
+        assert "_sa_instance_state" not in user_result  # filtered by default '_*' pattern
+        assert "x" in result
+
+    def test_default_underscore_ignore_output(self):
+        """Test that '_*' pattern is applied by default to ignore_output."""
+        output_data = {
+            "user": {
+                "name": "Alice",
+                "_sa_instance_state": "object"
+            },
+            "result": "success"
+        }
+        
+        result = _filter_and_serialize_output(output_data, None, None)
+        
+        # Result is serialized to JSON string for dicts
+        assert isinstance(result, str)
+        
+        # Parse it back to verify filtering worked
+        import json
+        parsed = json.loads(result)
+        assert "user" in parsed
+        assert "name" in parsed["user"]
+        assert parsed["user"]["name"] == "Alice"
+        assert "_sa_instance_state" not in parsed["user"]  # filtered by default '_*' pattern
+        assert "result" in parsed
+
+    def test_nested_underscore_filtering(self):
+        """Test that nested objects are filtered recursively."""
+        data = {
+            "level1": {
+                "public": "value1",
+                "_private": "value2",
+                "nested": {
+                    "public": "value3",
+                    "_private": "value4"
+                }
+            },
+            "_top_level": "value5"
+        }
+        
+        result = _apply_ignore_patterns(data, None)
+        
+        assert "level1" in result
+        assert "public" in result["level1"]
+        assert "_private" not in result["level1"]
+        assert "nested" in result["level1"]
+        assert "public" in result["level1"]["nested"]
+        assert "_private" not in result["level1"]["nested"]
+        assert "_top_level" not in result
+
+    def test_merge_with_default_patterns(self):
+        """Test that user-provided patterns are merged with default '_*' pattern."""
+        user_patterns = ["password", "api_key"]
+        merged = _merge_with_default_ignore_patterns(user_patterns)
+        
+        assert "_*" in merged
+        assert "password" in merged
+        assert "api_key" in merged
+        assert len(merged) == 3
+
+    def test_merge_with_default_patterns_none(self):
+        """Test that None patterns result in just default '_*' pattern."""
+        merged = _merge_with_default_ignore_patterns(None)
+        
+        assert merged == ["_*"]
+
+    def test_merge_with_default_patterns_duplicate(self):
+        """Test that duplicate patterns are not added."""
+        user_patterns = ["_*", "password"]
+        merged = _merge_with_default_ignore_patterns(user_patterns)
+        
+        assert merged == ["_*", "password"]  # _* is first, password is second
+        assert merged.count("_*") == 1
+
+    def test_default_underscore_with_custom_patterns(self):
+        """Test that default '_*' works alongside custom patterns."""
+        def test_func(user: dict, password: str, x: int):
+            pass
+        
+        sig = inspect.signature(test_func)
+        user_data = {"name": "Alice", "_sa_instance_state": "object"}
+        result = _prepare_and_filter_input(
+            (user_data, "secret", 5), 
+            {}, 
+            None, 
+            ["password"],  # Only specify password, '_*' should be added automatically
+            sig
+        )
+        
+        assert isinstance(result, dict)
+        assert "user" in result
+        user_result = result["user"]
+        assert "name" in user_result
+        assert "_sa_instance_state" not in user_result  # filtered by default '_*'
+        assert "password" not in result  # filtered by custom pattern
+        assert "x" in result
+
+    def test_nested_underscore_in_output(self):
+        """Test nested underscore filtering in output."""
+        output_data = {
+            "result": "success",
+            "user": {
+                "name": "Alice",
+                "_sa_instance_state": "object",
+                "profile": {
+                    "email": "alice@example.com",
+                    "_internal_id": "12345"
+                }
+            }
+        }
+        
+        result = _filter_and_serialize_output(output_data, None, None)
+        
+        import json
+        parsed = json.loads(result)
+        assert "user" in parsed
+        assert "name" in parsed["user"]
+        assert "_sa_instance_state" not in parsed["user"]
+        assert "profile" in parsed["user"]
+        assert "email" in parsed["user"]["profile"]
+        assert "_internal_id" not in parsed["user"]["profile"]
+
+    def test_apply_ignore_patterns_with_none(self):
+        """Test that _apply_ignore_patterns handles None patterns by recursively processing nested dicts."""
+        data = {
+            "public": "value",
+            "_private": "hidden",
+            "nested": {
+                "public": "value2",
+                "_private": "hidden2"
+            }
+        }
+        
+        result = _apply_ignore_patterns(data, None)
+        
+        # When patterns is None, it should still recursively process nested dicts
+        # but won't filter top-level keys (since no patterns provided)
+        assert "public" in result
+        assert "_private" in result  # Not filtered when patterns is None
+        assert "nested" in result
+        # Nested dicts are still processed recursively (structure preserved)
+        assert isinstance(result["nested"], dict)
+        assert "public" in result["nested"]
+        assert "_private" in result["nested"]  # Also not filtered when patterns is None
+
+
+class TestClientIgnoreProperties:
+    """Tests for client default_ignore_patterns and ignore_recursive properties."""
+
+    def test_default_ignore_patterns_property(self):
+        """Test setting and getting default_ignore_patterns on client."""
+        from aiqa import get_aiqa_client
+        
+        client = get_aiqa_client()
+        original = client.default_ignore_patterns
+        
+        # Test setting new patterns
+        client.default_ignore_patterns = ["_*", "password"]
+        assert client.default_ignore_patterns == ["_*", "password"]
+        
+        # Test that it's a copy (modifying returned list doesn't affect client)
+        patterns = client.default_ignore_patterns
+        patterns.append("new")
+        assert client.default_ignore_patterns == ["_*", "password"]
+        
+        # Test setting to None (disables defaults)
+        client.default_ignore_patterns = None
+        assert client.default_ignore_patterns == []
+        
+        # Test setting to empty list
+        client.default_ignore_patterns = []
+        assert client.default_ignore_patterns == []
+        
+        # Restore original
+        client.default_ignore_patterns = original
+
+    def test_ignore_recursive_property(self):
+        """Test setting and getting ignore_recursive on client."""
+        from aiqa import get_aiqa_client
+        
+        client = get_aiqa_client()
+        original = client.ignore_recursive
+        
+        # Test setting to False
+        client.ignore_recursive = False
+        assert client.ignore_recursive is False
+        
+        # Test setting to True
+        client.ignore_recursive = True
+        assert client.ignore_recursive is True
+        
+        # Restore original
+        client.ignore_recursive = original
+
+    def test_custom_default_ignore_patterns_used(self):
+        """Test that custom default ignore patterns are used in tracing."""
+        from aiqa import get_aiqa_client
+        from aiqa.tracing import _prepare_and_filter_input
+        import inspect
+        
+        client = get_aiqa_client()
+        original_patterns = client.default_ignore_patterns
+        
+        try:
+            # Set custom default patterns
+            client.default_ignore_patterns = ["password", "secret"]
+            
+            def test_func(password: str, secret: str, public: str):
+                pass
+            
+            sig = inspect.signature(test_func)
+            result = _prepare_and_filter_input(
+                ("pwd", "sec", "pub"), 
+                {}, 
+                None, 
+                None,  # No explicit ignore_input
+                sig
+            )
+            
+            # Custom patterns should be applied
+            assert "password" not in result
+            assert "secret" not in result
+            assert "public" in result
+        finally:
+            # Restore original
+            client.default_ignore_patterns = original_patterns
+
+    def test_ignore_recursive_false(self):
+        """Test that ignore_recursive=False only filters top-level keys."""
+        from aiqa import get_aiqa_client
+        
+        client = get_aiqa_client()
+        original_recursive = client.ignore_recursive
+        
+        try:
+            client.ignore_recursive = False
+            
+            data = {
+                "top_level": "value",
+                "_top_private": "hidden",
+                "nested": {
+                    "public": "value2",
+                    "_nested_private": "hidden2"
+                }
+            }
+            
+            result = _apply_ignore_patterns(data, ["_*"], recursive=False)
+            
+            # Top-level _* should be filtered
+            assert "_top_private" not in result
+            assert "top_level" in result
+            # Nested dict should be preserved as-is (not filtered recursively)
+            assert "nested" in result
+            assert "_nested_private" in result["nested"]  # Not filtered when recursive=False
+            assert "public" in result["nested"]
+        finally:
+            client.ignore_recursive = original_recursive
+
+    def test_ignore_recursive_true(self):
+        """Test that ignore_recursive=True filters nested keys."""
+        from aiqa import get_aiqa_client
+        
+        client = get_aiqa_client()
+        original_recursive = client.ignore_recursive
+        
+        try:
+            client.ignore_recursive = True
+            
+            data = {
+                "top_level": "value",
+                "_top_private": "hidden",
+                "nested": {
+                    "public": "value2",
+                    "_nested_private": "hidden2"
+                }
+            }
+            
+            result = _apply_ignore_patterns(data, ["_*"], recursive=True)
+            
+            # Top-level _* should be filtered
+            assert "_top_private" not in result
+            assert "top_level" in result
+            # Nested dict should also be filtered
+            assert "nested" in result
+            assert "_nested_private" not in result["nested"]  # Filtered when recursive=True
+            assert "public" in result["nested"]
+        finally:
+            client.ignore_recursive = original_recursive
+
+    def test_max_depth_prevents_infinite_loop(self):
+        """Test that max_depth prevents infinite loops from deep nesting."""
+        # Create a deeply nested structure
+        data = {"level": 0}
+        current = data
+        for i in range(150):  # Exceeds default max_depth of 100
+            current["nested"] = {"level": i + 1}
+            current = current["nested"]
+        
+        # Should not raise exception or hang
+        result = _apply_ignore_patterns(data, ["_*"], recursive=True, max_depth=100)
+        
+        # Should return something (may be truncated at max_depth)
+        assert isinstance(result, dict)
+        assert "level" in result
+
+    def test_client_ignore_recursive_affects_tracing(self):
+        """Test that client.ignore_recursive setting affects actual tracing."""
+        from aiqa import get_aiqa_client
+        from aiqa.tracing import _filter_and_serialize_output
+        
+        client = get_aiqa_client()
+        original_recursive = client.ignore_recursive
+        original_patterns = client.default_ignore_patterns
+        
+        try:
+            client.default_ignore_patterns = ["_*"]
+            
+            output_data = {
+                "top": "value",
+                "_top_private": "hidden",
+                "nested": {
+                    "public": "value2",
+                    "_nested_private": "hidden2"
+                }
+            }
+            
+            # Test with recursive=True (default)
+            client.ignore_recursive = True
+            result_recursive = _filter_and_serialize_output(output_data, None, None)
+            import json
+            parsed_recursive = json.loads(result_recursive)
+            assert "_top_private" not in parsed_recursive
+            assert "_nested_private" not in parsed_recursive["nested"]  # Filtered recursively
+            
+            # Test with recursive=False
+            client.ignore_recursive = False
+            result_non_recursive = _filter_and_serialize_output(output_data, None, None)
+            parsed_non_recursive = json.loads(result_non_recursive)
+            assert "_top_private" not in parsed_non_recursive
+            assert "_nested_private" in parsed_non_recursive["nested"]  # Not filtered when recursive=False
+        finally:
+            client.ignore_recursive = original_recursive
+            client.default_ignore_patterns = original_patterns

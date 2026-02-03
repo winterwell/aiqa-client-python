@@ -47,16 +47,16 @@ class TracingOptions:
             
             ignore_input: Iterable of keys (e.g., list, set) to exclude from
                 input data when recording span attributes. Applies after filter_input if both are set. 
-                Only applies when
-                input is a dictionary. Supports simple wildcards (e.g., `"_*"` 
-                matches `"_apple"`, `"_fruit"`). For example, use `["password", "api_key"]`
-                or `["_*", "password"]` to exclude sensitive fields from being traced.
+                Supports "self" and simple wildcards (e.g., `"_*"` 
+                matches `"_apple"`, `"_fruit"`). The pattern `"_*"` is applied by default
+                to filter properties starting with '_' in nested objects.
             
             ignore_output: Iterable of keys (e.g., list, set) to exclude from
                 output data when recording span attributes. Only applies when
                 output is a dictionary. Supports simple wildcards (e.g., `"_*"` 
-                matches `"_apple"`, `"_fruit"`). Useful for excluding large or sensitive
-                fields from traces.
+                matches `"_apple"`, `"_fruit"`). The pattern `"_*"` is applied by default
+                to filter properties starting with '_' in nested objects. Useful for excluding 
+                large or sensitive fields from traces.
             
             filter_input: Callable function that receives the same arguments as the
                 decorated function (*args, **kwargs) and returns a filtered/transformed
@@ -96,7 +96,7 @@ class TracingOptions:
                     filter_input=lambda self, example: {
                         "dataset": self.dataset_id,
                         "experiment": self.experiment_id,
-                        "example_id": example.id if hasattr(example, 'id') else None
+                        "example": example.id if hasattr(example, 'id') else None
                     }
                 )
                 def run_example(self, example):
@@ -168,31 +168,87 @@ def _prepare_input(args: tuple, kwargs: dict, sig: Optional[inspect.Signature] =
     return result
 
 
-def _apply_ignore_patterns(data_dict: dict, ignore_patterns: Optional[List[str]]) -> dict:
+def _apply_ignore_patterns(
+    data_dict: dict, 
+    ignore_patterns: Optional[List[str]], 
+    recursive: bool = True,
+    max_depth: int = 100,
+    current_depth: int = 0
+) -> dict:
     """
-    Apply ignore patterns to a dict.
+    Apply ignore patterns to a dict, optionally recursively.
     Supports string keys, wildcard patterns (*), and list of patterns.
     Used for both ignore_input and ignore_output.
     
     Args:
-        data_dict: Dictionary to filter
+        data_dict: Dictionary to filter (may contain nested dictionaries)
         ignore_patterns: List of patterns to exclude (e.g., ["self", "_*", "password"])
+        recursive: Whether to apply patterns recursively to nested dictionaries
+        max_depth: Maximum recursion depth to prevent infinite loops (default: 100)
+        current_depth: Current recursion depth (internal use)
     
     Returns:
         Filtered dictionary with matching keys removed
     """
-    if not ignore_patterns or not isinstance(data_dict, dict):
+    if not isinstance(data_dict, dict):
         return data_dict
     
-    result = data_dict.copy()
-    keys_to_delete = [
-        key for key in result.keys()
-        if _matches_ignore_pattern(key, ignore_patterns)
-    ]
-    for key in keys_to_delete:
-        del result[key]
+    # Safety check: prevent infinite loops from extremely deep nesting
+    if current_depth >= max_depth:
+        logger.warning(
+            f"_apply_ignore_patterns: max depth {max_depth} reached, "
+            f"stopping recursion to prevent infinite loop"
+        )
+        return data_dict
+    
+    # If no patterns, return copy (no filtering needed, even if recursive=True)
+    if not ignore_patterns:
+        return data_dict.copy()
+    
+    result = {}
+    for key, value in data_dict.items():
+        # Skip keys that match ignore patterns
+        if _matches_ignore_pattern(key, ignore_patterns):
+            continue
+        
+        # Recursively process nested dictionaries if recursive=True
+        if recursive and isinstance(value, dict):
+            result[key] = _apply_ignore_patterns(
+                value, ignore_patterns, recursive, max_depth, current_depth + 1
+            )
+        else:
+            result[key] = value
     
     return result
+
+
+def _merge_with_default_ignore_patterns(
+    ignore_patterns: Optional[List[str]], 
+    client: Optional[Any] = None
+) -> List[str]:
+    """
+    Merge user-provided ignore patterns with client's default ignore patterns.
+    
+    Args:
+        ignore_patterns: Optional list of user-provided patterns
+        client: Optional client instance (to avoid repeated get_aiqa_client() calls)
+    
+    Returns:
+        List of patterns including client's default ignore patterns
+    """
+    if client is None:
+        client = get_aiqa_client()
+    default_patterns = client.default_ignore_patterns
+    
+    if ignore_patterns is None:
+        return default_patterns.copy() if default_patterns else []
+    
+    # Merge patterns, avoiding duplicates
+    merged = list(default_patterns)
+    for pattern in ignore_patterns:
+        if pattern not in merged:
+            merged.append(pattern)
+    return merged
 
 
 def _prepare_and_filter_input(
@@ -209,6 +265,7 @@ def _prepare_and_filter_input(
     1. Apply filter_input to args, kwargs (receives same inputs as decorated function, including self)
     2. Convert into dict ready for span.attributes.input
     3. Apply ignore_input to the dict (supports string, wildcard, and list patterns)
+       Client's default ignore patterns are automatically merged with ignore_input.
     
     Args:
         args: Positional arguments (including self for bound methods)
@@ -218,7 +275,7 @@ def _prepare_and_filter_input(
             including `self` for bound methods. This allows extracting properties from any object.
         ignore_input: Optional list of keys/patterns to exclude from the final dict.
             If "self" is in ignore_input, it will be removed from the final dict but filter_input
-            still receives it.
+            still receives it. Client's default ignore patterns are automatically merged.
         sig: Optional function signature for proper arg name resolution
     
     Returns:
@@ -251,15 +308,23 @@ def _prepare_and_filter_input(
         input_data = _prepare_input(args, kwargs, sig)
     
     # Step 3: Apply ignore_input to the dict (removes "self" from final dict if specified)
-    should_ignore_self = ignore_input and "self" in ignore_input
+    # Merge with client's default ignore patterns
+    client = get_aiqa_client()
+    merged_ignore_input = _merge_with_default_ignore_patterns(ignore_input, client)
+    should_ignore_self = "self" in merged_ignore_input
+    
     if isinstance(input_data, dict):
-        input_data = _apply_ignore_patterns(input_data, ignore_input)
+        input_data = _apply_ignore_patterns(
+            input_data, 
+            merged_ignore_input, 
+            recursive=client.ignore_recursive
+        )
         # Handle case where we removed self and there are no remaining args/kwargs
         if should_ignore_self and not input_data:
             return None
-    elif ignore_input:
-        # Warn if ignore_input is set but input_data is not a dict
-        logger.warning(f"_prepare_and_filter_input: skip: ignore_input is set but input_data is not a dict: {type(input_data)}")
+    elif merged_ignore_input:
+        # Warn if ignore patterns are set but input_data is not a dict
+        logger.warning(f"_prepare_and_filter_input: skip: ignore patterns are set but input_data is not a dict: {type(input_data)}")
     
     return input_data
 
@@ -269,7 +334,10 @@ def _filter_and_serialize_output(
     filter_output: Optional[Callable[[Any], Any]],
     ignore_output: Optional[List[str]],
 ) -> Any:
-    """Filter and serialize output for span attributes."""
+    """
+    Filter and serialize output for span attributes.
+    Client's default ignore patterns are automatically merged with ignore_output.
+    """
     output_data = result
     if filter_output:
         if isinstance(output_data, dict):
@@ -277,11 +345,19 @@ def _filter_and_serialize_output(
         output_data = filter_output(output_data)
     
     # Apply ignore_output patterns (supports key, wildcard, and list patterns)
+    # Merge with client's default ignore patterns
+    client = get_aiqa_client()
+    merged_ignore_output = _merge_with_default_ignore_patterns(ignore_output, client)
+    
     if isinstance(output_data, dict):
-        output_data = _apply_ignore_patterns(output_data, ignore_output)
-    elif ignore_output:
-        # Warn if ignore_output is set but output_data is not a dict
-        logger.warning(f"_filter_and_serialize_output: skip: ignore_output is set but output_data is not a dict: {type(output_data)}")
+        output_data = _apply_ignore_patterns(
+            output_data, 
+            merged_ignore_output,
+            recursive=client.ignore_recursive
+        )
+    elif merged_ignore_output:
+        # Warn if ignore patterns are set but output_data is not a dict
+        logger.warning(f"_filter_and_serialize_output: skip: ignore patterns are set but output_data is not a dict: {type(output_data)}")
     
     # Serialize immediately to create immutable result (removes mutable structures)
     return serialize_for_span(output_data)
@@ -500,12 +576,14 @@ def WithTracing(
         ignore_input: List of keys to exclude from input data when recording span attributes.
             self is handled as "self"
             Supports simple wildcards (e.g., "_*" 
-            matches "_apple", "_fruit"). For example, use ["password", "api_key"] or 
-            ["_*", "password"] to exclude sensitive fields from being traced.
+            matches "_apple", "_fruit"). The pattern "_*" is applied by default
+            to filter properties starting with '_' in nested objects. For example, use 
+            ["password", "api_key"] to exclude additional sensitive fields from being traced.
         ignore_output: List of keys to exclude from output data when recording span attributes.
             Only applies when output is a dictionary. Supports simple wildcards (e.g., "_*" 
-            matches "_apple", "_fruit"). Useful for excluding large or sensitive
-            fields from traces.
+            matches "_apple", "_fruit"). The pattern "_*" is applied by default
+            to filter properties starting with '_' in nested objects. Useful for excluding 
+            large or sensitive fields from traces.
         filter_input: Function to filter/transform input before recording.
             Receives the same arguments as the decorated function (*args, **kwargs),
             including `self` for bound methods. This allows you to extract specific
@@ -678,7 +756,8 @@ def WithTracing(
             # This is called lazily when the function runs, not at decorator definition time
             client = get_aiqa_client()
             if not client.enabled:
-                return await executor()
+                # executor() returns an async generator object, not a coroutine, so don't await it
+                return executor()
             
             # Get tracer after initialization (lazy)
             tracer = get_aiqa_tracer()

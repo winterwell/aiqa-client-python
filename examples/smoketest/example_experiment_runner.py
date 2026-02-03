@@ -90,8 +90,8 @@ async def example_basic_usage():
             print(f"No results for example {example['id']}")
 
     # Get summary results
-    summary_results = experiment_runner.get_summary_results()
-    print(f"Summary results: {summary_results}")
+    summaries = experiment_runner.get_summaries()
+    print(f"Summaries: {summaries}")
 
 
 async def example_with_experiment_setup():
@@ -114,10 +114,6 @@ async def example_with_experiment_setup():
                 "model": "gpt-4",
                 "temperature": 0.7,
             },
-            "comparison_parameters": [
-                {"temperature": 0.5},
-                {"temperature": 0.9},
-            ],
         }
     )
 
@@ -163,8 +159,8 @@ async def example_stepwise():
             print(f"Example {example['id']} failed: {e}")
 
     # Get final summary
-    summary = experiment_runner.get_summary_results()
-    print(f"Final summary: {summary}")
+    summaries = experiment_runner.get_summaries()
+    print(f"Final summaries: {summaries}")
 
 
 if __name__ == "__main__":

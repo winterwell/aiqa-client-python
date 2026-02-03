@@ -52,14 +52,15 @@ async def get_model_from_server(
     try:
         def _do_request():
             return requests.get(
-                f"{server_url}/model/{model_id}?fields=api_key",
+                f"{server_url}/model/{model_id}?fields=apiKey",  # Server uses camelCase 'apiKey' (also accepts 'api_key')
                 headers=headers,
             )
         
         response = await asyncio.to_thread(_do_request)
         if response.ok:
             model = response.json()
-            if model.get("api_key"):
+            # Server returns 'apiKey' (camelCase)
+            if model.get("apiKey"):
                 return model
         return None
     except Exception as e:
