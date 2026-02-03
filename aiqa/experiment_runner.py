@@ -5,11 +5,16 @@ ExperimentRunner - runs experiments on datasets and scores results
 import os
 import time
 import asyncio
+from opentelemetry import context as otel_context
+from opentelemetry.trace import Status, StatusCode, set_span_in_context
 from .constants import LOG_TAG
 from .http_utils import build_headers, get_server_url, get_api_key, format_http_error
 from typing import Any, Dict, List, Optional, Callable, Awaitable, Union
 from .tracing import WithTracing
-from .span_helpers import set_span_attribute, flush_tracing
+from .span_helpers import set_span_attribute, flush_tracing, get_active_trace_id
+from .client import get_aiqa_client, get_aiqa_tracer, get_component_tag
+from .object_serialiser import serialize_for_span
+from .tracing_llm_utils import _extract_and_set_token_usage, _extract_and_set_provider_and_model
 from .llm_as_judge import score_llm_metric_local, get_model_from_server, call_llm_fallback
 import requests
 from .types import MetricResult, ScoreThisInputOutputMetricType, Example, Result, Metric, CallLLMType
@@ -25,31 +30,9 @@ CallMyCodeType = Callable[[Any, Dict[str, Any]], Union[Any, Awaitable[Any]]]
 ScoreThisOutputType = Callable[[Any, Any, Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]]
 
 
-
-def _filter_input_for_run(input_data: Any) -> Dict[str, Any]:
-    """Tracing:Filter input - drop most, keep just ids"""
-    if not isinstance(input_data, dict):
-        return {}
-    self_obj = input_data.get("self")
-    if not self_obj:
-        return {}
-    return {
-        "dataset": getattr(self_obj, "dataset_id", None),
-        "experiment": getattr(self_obj, "experiment_id", None),
-    }
-
-
-def _filter_input_for_run_example(
-    self: "ExperimentRunner", 
-    example: Dict[str, Any],
-    call_my_code: Any = None,
-    score_this_output: Any = None,
-) -> Dict[str, Any]:
-    """Filter input for run_example method to extract dataset, experiment, and example IDs."""
-    result = _filter_input_for_run({"self": self})
-    if isinstance(example, dict):
-        result["example"] = example.get("id")
-    return result
+def _metric_score_key(metric: Dict[str, Any]) -> str:
+    """Key for scores in API: server expects metric name (fallback to id)."""
+    return (metric.get("name") or metric.get("id")) or ""
 
 
 class ExperimentRunner:
@@ -144,7 +127,7 @@ class ExperimentRunner:
             List of example objects
         """
         params = {
-            "dataset_id": self.dataset_id,
+            "dataset": self.dataset_id,
             "limit": str(limit),
         }
         if self.organisation:
@@ -216,6 +199,7 @@ class ExperimentRunner:
         example: Example,
         output: Any,
         result: Result,
+        trace_id: Optional[str] = None,
     ) -> Result:
         """
         Ask the server to score an example result. Stores the score for later summary calculation.
@@ -235,21 +219,20 @@ class ExperimentRunner:
         if not example_id:
             raise ValueError("Example must have an 'id' field")
         if result is None:
-            result = Result(example=example_id, scores={}, messages={}, errors={})
+            result = {"example": example_id, "scores": {}, "messages": {}, "errors": {}}
         scores = result.get("scores") or {}
-
-        
         
         print(f"Scoring and storing example: {example_id}")
         print(f"Scores: {scores}")
 
         # Run synchronous requests.post in a thread pool to avoid blocking
+        # Server expects output = raw output to score, not the result dict; scores keyed by metric name
         def _do_request():
             return requests.post(
                 f"{self.server_url}/experiment/{self.experiment_id}/example/{example_id}/scoreAndStore",
                 json={
-                    "output": result,
-                    "traceId": example.get("trace"),  # Server returns 'trace' (lowercase), but API expects 'traceId' (camelCase)
+                    "output": output,
+                    "trace": trace_id,
                     "scores": scores,
                 },
                 headers=self._get_headers(),
@@ -264,7 +247,6 @@ class ExperimentRunner:
         print(f"scoreAndStore response: {json_result}")
         return json_result
 
-    @WithTracing(filter_input=_filter_input_for_run)
     async def run(
         self,
         call_my_code: CallMyCodeType,
@@ -279,17 +261,9 @@ class ExperimentRunner:
         """
         examples = self.get_examples_for_dataset()
 
-        # Wrap engine to match run_example signature (input, parameters)
-        async def wrapped_engine(input_data, parameters):
-            result = call_my_code(input_data, parameters)
-            # Handle async functions
-            if hasattr(result, "__await__"):
-                result = await result
-            return result
-
         for example in examples:
             try:
-                scores = await self.run_example(example, wrapped_engine, scorer_for_metric_id)
+                scores = await self.run_example(example, call_my_code, scorer_for_metric_id)
                 if scores:
                     self.scores.append(
                         {
@@ -302,7 +276,6 @@ class ExperimentRunner:
                 print(f"Error processing example {example.get('id', 'unknown')}: {e}")
                 # Continue with next example instead of failing entire run
 
-    @WithTracing(filter_input=_filter_input_for_run_example)
     async def run_example(
         self,
         example: Example,
@@ -311,6 +284,9 @@ class ExperimentRunner:
     ) -> List[Result]:
         """
         Run the engine on an example with the experiment's parameters, score the result, and store it.
+
+        Spans: one root "RunExample" span (input, call_my_code, output) and one child "ScoreExample"
+        span for scoring, so the server sees a clear call_my_code vs scoring split (aligned with client-go).
 
         Args:
             example: The example to run. See Example.ts type
@@ -335,7 +311,6 @@ class ExperimentRunner:
         example_id = example.get("id")
         if not example_id:
             raise ValueError("Example must have an 'id' field")
-        set_span_attribute("example", example_id)
 
         print(f"Running with parameters: {parameters_here}")
         original_env_vars: Dict[str, Optional[str]] = {}
@@ -345,7 +320,25 @@ class ExperimentRunner:
                 os.environ[key] = str(value)
         try:
             start = time.time() * 1000
-            output = call_my_code(input_data, parameters_here)
+
+            run_trace_id_ref: List[Optional[str]] = [None]
+
+            # Wrap engine to match run_example signature (input, parameters)
+            # Root span so server can find it by parent:unset; trace ID is sent to scoreAndStore
+            def set_trace_id(tid: Optional[str]) -> None:
+                run_trace_id_ref[0] = tid
+
+            @WithTracing(root=True)
+            async def wrapped_engine(input_data, parameters, set_trace_id: Callable[[Optional[str]], None]):
+                trace_id_here = get_active_trace_id()
+                set_trace_id(trace_id_here)
+                result = call_my_code(input_data, parameters)
+                # Handle async functions
+                if hasattr(result, "__await__"):
+                    result = await result
+                return result
+
+            output = wrapped_engine(input_data, parameters_here, set_trace_id)
             if hasattr(output, "__await__"):
                 output = await output
             duration = int((time.time() * 1000) - start)
@@ -354,10 +347,11 @@ class ExperimentRunner:
             dataset_metrics = self.get_dataset().get("metrics", [])
             specific_metrics = example.get("metrics", [])
             metrics = [*dataset_metrics, *specific_metrics]
-            result = Result(example=example_id, scores={}, messages={}, errors={})
+            result: Result = {"example": example_id, "scores": {}, "messages": {}, "errors": {}}
             for metric in metrics:
                 metric_id = metric.get("id")
-                if not metric_id:
+                score_key = _metric_score_key(metric)
+                if not metric_id or not score_key:
                     continue
                 scorer = scorer_for_metric_id.get(metric_id) if scorer_for_metric_id else None
                 if scorer:
@@ -367,15 +361,15 @@ class ExperimentRunner:
                 else:
                     continue
                 if not metric_result:
-                    result["errors"][metric_id] = "Scoring function returned None"
+                    result["errors"][score_key] = "Scoring function returned None"
                     continue
-                result["scores"][metric_id] = metric_result.get("score")
-                result["messages"][metric_id] = metric_result.get("message")
-                result["errors"][metric_id] = metric_result.get("error")
+                result["scores"][score_key] = metric_result.get("score")
+                result["messages"][score_key] = metric_result.get("message")
+                result["errors"][score_key] = metric_result.get("error")
             result["scores"]["duration"] = duration
             await flush_tracing()
             print(f"Call scoreAndStore ... for example: {example_id} with scores: {result['scores']}")
-            result = await self.score_and_store(example, output, result)
+            result = await self.score_and_store(example, output, result, trace_id=run_trace_id_ref[0])
             print(f"scoreAndStore returned: {result}")
             return [result]
         finally:

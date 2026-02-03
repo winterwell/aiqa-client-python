@@ -7,7 +7,7 @@ import inspect
 import fnmatch
 from typing import Any, Callable, Optional, List
 from functools import wraps
-from opentelemetry import trace
+from opentelemetry import context as otel_context, trace
 from opentelemetry.trace import Status, StatusCode
 
 from .client import get_aiqa_client, get_component_tag, get_aiqa_tracer
@@ -563,6 +563,7 @@ def WithTracing(
     ignore_output: Optional[List[str]] = None,
     filter_input: Optional[Callable[[Any], Any]] = None,
     filter_output: Optional[Callable[[Any], Any]] = None,
+    root: bool = False,
 ):
     """
     Decorator to automatically create spans for function calls.
@@ -592,6 +593,7 @@ def WithTracing(
             Returns a dict or any value (will be converted to dict). Applied before ignore_input.
         filter_output: Function to filter/transform output before recording.
             Receives the output value and returns a filtered/transformed version.
+        root: Whether this is a root span. If True, the span will not be linked to any parent spans.
     
     Example:
         @WithTracing
@@ -685,7 +687,8 @@ def WithTracing(
                 return executor()
             # Get tracer after initialization (lazy)
             tracer = get_aiqa_tracer()
-            with tracer.start_as_current_span(fn_name) as span:
+            span_kw = {"context": otel_context.Context()} if root else {}
+            with tracer.start_as_current_span(fn_name, **span_kw) as span:
                 if not _setup_span(span, input_data):
                     return executor() # span is not recording, so just execute the function and return the result                
                 try:
@@ -706,7 +709,8 @@ def WithTracing(
             
             # Get tracer after initialization (lazy)
             tracer = get_aiqa_tracer()
-            with tracer.start_as_current_span(fn_name) as span:
+            span_kw = {"context": otel_context.Context()} if root else {}
+            with tracer.start_as_current_span(fn_name, **span_kw) as span:
                 if not _setup_span(span, input_data):
                     return await executor()
                 
@@ -732,7 +736,8 @@ def WithTracing(
             # Get tracer after initialization (lazy)
             tracer = get_aiqa_tracer()
             # Create span but don't use 'with' - span will be closed by TracedGenerator
-            span = tracer.start_span(fn_name)
+            span_kw = {"context": otel_context.Context()} if root else {}
+            span = tracer.start_span(fn_name, **span_kw)
             token = trace.context_api.attach(trace.context_api.set_span_in_context(span))
             
             try:
@@ -762,7 +767,8 @@ def WithTracing(
             # Get tracer after initialization (lazy)
             tracer = get_aiqa_tracer()
             # Create span but don't use 'with' - span will be closed by TracedAsyncGenerator
-            span = tracer.start_span(fn_name)
+            span_kw = {"context": otel_context.Context()} if root else {}
+            span = tracer.start_span(fn_name, **span_kw)
             token = trace.context_api.attach(trace.context_api.set_span_in_context(span))
             
             try:
