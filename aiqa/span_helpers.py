@@ -101,6 +101,7 @@ def set_token_usage(
         input_tokens: Number of input tokens used (maps to gen_ai.usage.input_tokens)
         output_tokens: Number of output tokens generated (maps to gen_ai.usage.output_tokens)
         total_tokens: Total number of tokens used (maps to gen_ai.usage.total_tokens)
+    Zero is valid (e.g. when the traced function did not call an LLM).
     
     Returns:
         True if at least one token usage attribute was set, False if no active span found
@@ -118,6 +119,7 @@ def set_token_usage(
                 total_tokens=response.usage.total_tokens
             )
             return response
+        # When there was no LLM call: set_token_usage(0, 0, 0)
     """
     span = trace.get_current_span()
     if not span or not span.is_recording():
@@ -286,50 +288,39 @@ def create_span_from_trace_id(
             # Your code here
             pass
     """
-    try:
-        # Parse trace ID from hex string
-        trace_id_int = int(trace_id, 16)
-        
-        # Parse parent span ID if provided
-        parent_span_id_int = None
-        if parent_span_id:
-            parent_span_id_int = int(parent_span_id, 16)
-        
-        # Create a parent span context
-        parent_span_context = SpanContext(
-            trace_id=trace_id_int,
-            span_id=parent_span_id_int if parent_span_id_int else 0,
-            is_remote=True,
-            trace_flags=TraceFlags(0x01),  # SAMPLED flag
-        )
-        
-        # Create a context with this span context as the parent
-        from opentelemetry.trace import set_span_in_context
-        parent_context = set_span_in_context(trace.NonRecordingSpan(parent_span_context))
-        
-        # Ensure initialization before creating span
-        get_aiqa_client()
-        # Start a new span in this context (it will be a child of the parent span)
-        tracer = get_aiqa_tracer()
-        span = tracer.start_span(span_name, context=parent_context)
-        
-        # Set component tag if configured
-        component_tag = get_component_tag()
-        if component_tag:
-            span.set_attribute("gen_ai.component.id", component_tag)
-        
-        return span
-    except (ValueError, AttributeError) as e:
-        logger.error(f"Error creating span from trace_id: {e}")
-        # Ensure initialization before creating span
-        get_aiqa_client()
-        # Fallback: create a new span
-        tracer = get_aiqa_tracer()
-        span = tracer.start_span(span_name)
-        component_tag = get_component_tag()
-        if component_tag:
-            span.set_attribute("gen_ai.component.id", component_tag)
-        return span
+    # Parse trace ID from hex string
+    trace_id_int = int(trace_id, 16)
+    
+    # Parse parent span ID if provided
+    parent_span_id_int = None
+    if parent_span_id:
+        parent_span_id_int = int(parent_span_id, 16)
+    
+    # Create a parent span context
+    parent_span_context = SpanContext(
+        trace_id=trace_id_int,
+        span_id=parent_span_id_int if parent_span_id_int else 0,
+        is_remote=True,
+        trace_flags=TraceFlags(0x01),  # SAMPLED flag
+    )
+    
+    # Create a context with this span context as the parent
+    from opentelemetry.trace import set_span_in_context
+    parent_context = set_span_in_context(trace.NonRecordingSpan(parent_span_context))
+    
+    # Ensure initialization before creating span
+    get_aiqa_client()
+    # Start a new span in this context (it will be a child of the parent span)
+    tracer = get_aiqa_tracer()
+    span = tracer.start_span(span_name, context=parent_context)
+    
+    # Set component tag if configured
+    component_tag = get_component_tag()
+    if component_tag:
+        span.set_attribute("gen_ai.component.id", component_tag)
+    
+    return span
+
 
 
 def inject_trace_context(carrier: dict) -> None:
@@ -488,10 +479,9 @@ async def submit_feedback(
     try:
         # Set feedback attributes
         if thumbs_up is not None:
-            span.set_attribute('feedback.thumbs_up', thumbs_up)
-            span.set_attribute('feedback.type', 'positive' if thumbs_up else 'negative')
+            span.set_attribute('feedback.value', 'positive' if thumbs_up else 'negative')
         else:
-            span.set_attribute('feedback.type', 'neutral')
+            span.set_attribute('feedback.value', 'neutral')
         
         if comment:
             span.set_attribute('feedback.comment', comment)
@@ -504,8 +494,8 @@ async def submit_feedback(
         
         # Flush to ensure it's sent immediately
         await flush_tracing()
-    except Exception as e:
+    except Exception:
         span.end()
-        raise e
+        raise
 
 

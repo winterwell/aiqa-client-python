@@ -188,6 +188,17 @@ class TestSerializeForSpan:
         assert isinstance(result, str)
         assert "key" in result
 
+    def test_dict_private_keys_omitted_in_json(self):
+        """Serialized span input omits keys starting with '_' (e.g. ORM state)."""
+        result = serialize_for_span({"user_message": "hi", "mystery": {"id": 9, "_sa_instance_state": {}}})
+        assert isinstance(result, str)
+        import json
+        parsed = json.loads(result)
+        assert "user_message" in parsed
+        assert "mystery" in parsed
+        assert "id" in parsed["mystery"]
+        assert "_sa_instance_state" not in parsed["mystery"]
+
 
 class TestSafeStrRepr:
     """Tests for safe_str_repr function."""
@@ -307,6 +318,52 @@ class TestObjectToDict:
         assert isinstance(result, dict)
         assert result["name"] == "test"
         assert result["value"] == 42
+
+    def test_dict_private_keys_omitted(self):
+        """Keys starting with '_' are omitted so ORM/internal state is not serialized."""
+        obj = {"id": 9, "title": "Mystery", "_sa_instance_state": {"key": [1], "session_id": 1}}
+        result = object_to_dict(obj, set())
+        assert result["id"] == 9
+        assert result["title"] == "Mystery"
+        assert "_sa_instance_state" not in result
+
+    def test_object_with_private_attrs_omitted(self):
+        """Object __dict__ with _* keys (e.g. SQLAlchemy) omits those keys when converted."""
+        class ModelLike:
+            def __init__(self):
+                self.id = 9
+                self.title = "Mystery"
+                self._sa_instance_state = "internal"
+                self._instance_dict = "internal"
+        obj = ModelLike()
+        result = object_to_dict(obj, set())
+        assert result["id"] == 9
+        assert result["title"] == "Mystery"
+        assert "_sa_instance_state" not in result
+        assert "_instance_dict" not in result
+
+    def test_dataclass_private_field_omitted(self):
+        """Dataclass fields starting with '_' are omitted."""
+        @dataclasses.dataclass
+        class C:
+            name: str
+            _internal: str = "hidden"
+        obj = C(name="a", _internal="b")
+        result = object_to_dict(obj, set())
+        assert result["name"] == "a"
+        assert "_internal" not in result
+
+    def test_slots_private_omitted(self):
+        """__slots__ entries starting with '_' are omitted."""
+        class Slotted:
+            __slots__ = ["name", "_internal"]
+            def __init__(self):
+                self.name = "a"
+                self._internal = "b"
+        obj = Slotted()
+        result = object_to_dict(obj, set())
+        assert result["name"] == "a"
+        assert "_internal" not in result
 
 
 class TestSizeLimitedJSONEncoder:

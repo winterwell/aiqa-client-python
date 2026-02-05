@@ -8,8 +8,8 @@ import asyncio
 from opentelemetry import context as otel_context
 from opentelemetry.trace import Status, StatusCode, set_span_in_context
 from .constants import LOG_TAG
-from .http_utils import build_headers, get_server_url, get_api_key, format_http_error
-from typing import Any, Dict, List, Optional, Callable, Awaitable, Union
+from .http_utils import build_headers, get_server_url, get_api_key, format_http_error, parse_json_response
+from typing import Any, Callable, Dict, List, Optional
 from .tracing import WithTracing
 from .span_helpers import set_span_attribute, flush_tracing, get_active_trace_id
 from .client import get_aiqa_client, get_aiqa_tracer, get_component_tag
@@ -17,22 +17,12 @@ from .object_serialiser import serialize_for_span
 from .tracing_llm_utils import _extract_and_set_token_usage, _extract_and_set_provider_and_model
 from .llm_as_judge import score_llm_metric_local, get_model_from_server, call_llm_fallback
 import requests
-from .types import MetricResult, ScoreThisInputOutputMetricType, Example, Result, Metric, CallLLMType
-
-# Type aliases for engine/scoring functions to improve code completion and clarity
-from typing import TypedDict
-
-# Function that processes input and parameters to produce an output (sync or async)
-CallMyCodeType = Callable[[Any, Dict[str, Any]], Union[Any, Awaitable[Any]]]
-
-# Function that scores a given output, using input, example, and parameters (usually async)
-# Returns a dictionary with score/message/etc.
-ScoreThisOutputType = Callable[[Any, Any, Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]]
+from .types import MetricResult, ScoreThisInputOutputMetricType, Example, Result, Metric, CallLLMType, CallMyCodeType
 
 
 def _metric_score_key(metric: Dict[str, Any]) -> str:
-    """Key for scores in API: server expects metric name (fallback to id)."""
-    return (metric.get("name") or metric.get("id")) or ""
+    """Key for scores in API: server and webapp expect metric id (fallback to name)."""
+    return (metric.get("id") or metric.get("name")) or ""
 
 
 class ExperimentRunner:
@@ -126,6 +116,10 @@ class ExperimentRunner:
         Returns:
             List of example objects
         """
+        # Ensure organisation is set (required by server); derive from dataset if needed
+        if not self.organisation:
+            self.get_dataset()
+
         params = {
             "dataset": self.dataset_id,
             "limit": str(limit),
@@ -142,7 +136,7 @@ class ExperimentRunner:
         if not response.ok:
             raise Exception(format_http_error(response, "fetch example inputs"))
 
-        data = response.json()
+        data = parse_json_response(response, "fetch example inputs")
         return data.get("hits", [])
 
     def create_experiment(
@@ -159,13 +153,15 @@ class ExperimentRunner:
         Returns:
             The created experiment object
         """
+        if not self.dataset_id:
+            raise Exception("Dataset ID is required to create an experiment.")
         # Ensure we have the organisation ID - try to get it from the dataset if not set
         if not self.organisation:
             dataset = self.get_dataset()
             self.organisation = dataset.get("organisation")
         
         if not self.organisation or not self.dataset_id:
-            raise Exception("Organisation and dataset ID are required to create an experiment. Organisation can be derived from the dataset or set via organisation_id parameter.")
+            raise Exception("Organisation ID is required to create an experiment. Organisation can be derived from the dataset or set via organisation_id parameter.")
 
         if not experiment_setup:
             experiment_setup = {}

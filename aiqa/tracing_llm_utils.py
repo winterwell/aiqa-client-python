@@ -1,4 +1,5 @@
 # Functions for extracting and setting LLM-specific attributes on a span.
+import json
 import logging
 from .constants import LOG_TAG
 from opentelemetry import trace
@@ -32,6 +33,22 @@ def _is_attribute_set(span: trace.Span, attribute_name: str) -> bool:
     except Exception:
         # If anything goes wrong, assume not set (conservative approach)
         return False
+
+# Use explicit None checks so 0 is preserved (otherwise we would treat 0 as falsy and drop it).
+def _get(d: dict, *keys: str) -> Any:
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def _attr(obj: Any, *keys: str) -> Any:
+    for k in keys:
+        v = getattr(obj, k, None)
+        if v is not None:
+            return v
+    return None
 
 def _extract_and_set_token_usage(span: trace.Span, result: Any) -> None:
     """
@@ -72,6 +89,12 @@ def _extract_and_set_token_usage(span: trace.Span, result: Any) -> None:
             # Check if result has a 'usage' attribute (e.g., OpenAI response object)
             elif hasattr(result, "usage"):
                 usage = result.usage
+
+            # Fallback: result may be raw response text (e.g. response.text) stored as JSON string
+            elif isinstance(result, str) and result.strip().startswith("{"):
+                parsed = json.loads(result)
+                if isinstance(parsed, dict):
+                    usage = parsed.get("usage")
         except Exception:
             # If accessing result properties fails, just return silently
             return
@@ -80,20 +103,22 @@ def _extract_and_set_token_usage(span: trace.Span, result: Any) -> None:
         if usage is not None:
             try:
                 # Support both OpenAI format (prompt_tokens/completion_tokens) and Bedrock format (input_tokens/output_tokens)
-                # Handle dict case
+               
+
                 if isinstance(usage, dict):
-                    prompt_tokens = usage.get("prompt_tokens") or usage.get("PromptTokens")
-                    completion_tokens = usage.get("completion_tokens") or usage.get("CompletionTokens")
-                    input_tokens = usage.get("input_tokens") or usage.get("InputTokens")
-                    output_tokens = usage.get("output_tokens") or usage.get("OutputTokens")
-                    total_tokens = usage.get("total_tokens") or usage.get("TotalTokens")
+                    prompt_tokens = _get(usage, "prompt_tokens", "PromptTokens")
+                    completion_tokens = _get(usage, "completion_tokens", "CompletionTokens")
+                    input_tokens = _get(usage, "input_tokens", "InputTokens")
+                    output_tokens = _get(usage, "output_tokens", "OutputTokens")
+                    total_tokens = _get(usage, "total_tokens", "TotalTokens")
                 # Handle object case (e.g., OpenAI Usage object)
                 else:
-                    prompt_tokens = getattr(usage, "prompt_tokens", None) or getattr(usage, "PromptTokens", None)
-                    completion_tokens = getattr(usage, "completion_tokens", None) or getattr(usage, "CompletionTokens", None)
-                    input_tokens = getattr(usage, "input_tokens", None) or getattr(usage, "InputTokens", None)
-                    output_tokens = getattr(usage, "output_tokens", None) or getattr(usage, "OutputTokens", None)
-                    total_tokens = getattr(usage, "total_tokens", None) or getattr(usage, "TotalTokens", None)
+                  
+                    prompt_tokens = _attr(usage, "prompt_tokens", "PromptTokens")
+                    completion_tokens = _attr(usage, "completion_tokens", "CompletionTokens")
+                    input_tokens = _attr(usage, "input_tokens", "InputTokens")
+                    output_tokens = _attr(usage, "output_tokens", "OutputTokens")
+                    total_tokens = _attr(usage, "total_tokens", "TotalTokens")
                 
                 # Use Bedrock format if OpenAI format not available
                 if prompt_tokens is None:

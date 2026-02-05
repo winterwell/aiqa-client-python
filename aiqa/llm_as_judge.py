@@ -4,11 +4,14 @@ LLM-as-judge scoring functionality for evaluating outputs.
 
 import os
 import json
-import re
 import asyncio
+import logging
 import requests
 from typing import Any, Dict, Optional, Callable, Awaitable
+from .constants import LOG_TAG
 from .types import MetricResult, Metric, Example, CallLLMType
+
+logger = logging.getLogger(LOG_TAG)
 
 def parse_llm_response(content: str) -> Optional[MetricResult]:
     """
@@ -30,8 +33,7 @@ def parse_llm_response(content: str) -> Optional[MetricResult]:
         score = max(0.0, min(1.0, float(score)))
         return {"score": score, "message": message}
     except (json.JSONDecodeError, ValueError, TypeError) as e:
-        print(f"Failed to parse JSON response: {e}")
-        # Fallback: try to extract score from text
+        logger.warning("Failed to parse JSON response: %s", e)
         raise Exception(f"Could not parse LLM response: {content}")
 
 
@@ -64,7 +66,7 @@ async def get_model_from_server(
                 return model
         return None
     except Exception as e:
-        print(f"Warning: Could not fetch model from server: {e}")
+        logger.warning("Could not fetch model from server: %s", e)
         return None
 
 
@@ -107,7 +109,7 @@ async def call_openai(
     if not content:
         raise Exception("OpenAI API did not return content")
 
-    print(f"OpenAI raw response: {content[:500]}...")  # Show first 500 chars
+    logger.debug("OpenAI raw response: %s...", content[:500])
     return content
 
 
@@ -148,7 +150,7 @@ async def call_anthropic(
     if not content:
         raise Exception("Anthropic API did not return content")
 
-    print(f"Anthropic raw response: {content[:500]}...")  # Show first 500 chars
+    logger.debug("Anthropic raw response: %s...", content[:500])
     return content
 
 
@@ -188,10 +190,10 @@ async def call_llm_fallback(
         anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 
         if openai_key:
-            print("Using OpenAI API (from OPENAI_API_KEY env var)")
+            logger.debug("Using OpenAI API (from OPENAI_API_KEY env var)")
             content = await call_openai(system_prompt, user_message, openai_key)
         elif anthropic_key:
-            print("Using Anthropic API (from ANTHROPIC_API_KEY env var)")
+            logger.debug("Using Anthropic API (from ANTHROPIC_API_KEY env var)")
             content = await call_anthropic(system_prompt, user_message, anthropic_key)
         else:
             raise Exception(
@@ -260,14 +262,11 @@ Be strict but fair in your evaluation."""
 </OUTPUT>
 Evaluate this OUTPUT according to the metric and return ONLY a valid JSON object {{"score": number, "message": string}}."""
 
-    # Debug: print what we're sending to the LLM
-    print(f"DEBUG: Sending to LLM scorer:")
-    print(f"  System prompt: {system_prompt[:200]}...")
-    print(f"  User message: {user_message[:500]}...")
-    print(f"  Example input extracted: {repr(input_text[:100])}")
-
-    # Call LLM
-    print(f"Calling LLM to score metric '{metric.get('name')}'...")
+    logger.debug(
+        "Sending to LLM scorer: system_prompt=%s..., user_message=%s..., input_sample=%s",
+        system_prompt[:200], user_message[:500], repr(input_text[:100]),
+    )
+    logger.debug("Calling LLM to score metric '%s'", metric.get("name"))
     if llm_call_fn:
         result = await llm_call_fn(system_prompt, user_message)
     else:

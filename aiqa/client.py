@@ -327,16 +327,14 @@ def _attach_aiqa_processor(provider: TracerProvider) -> None:
             endpoint = f"{base_url}/v1/traces"
         
         # Get timeout from environment variable (in seconds)
-        # Supports OTEL_EXPORTER_OTLP_TIMEOUT (standard) or AIQA_EXPORT_TIMEOUT (custom)
-        # Default is 30 seconds (more generous than OTLP default of 10s)
+        # AIQA_EXPORT_TIMEOUT (custom) or OTEL_EXPORTER_OTLP_TIMEOUT (standard). Default 30s.
         timeout = 30.0
-        otlp_timeout = os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
-        
-        if otlp_timeout:
+        timeout_str = os.getenv("AIQA_EXPORT_TIMEOUT") or os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
+        if timeout_str:
             try:
-                timeout = float(otlp_timeout)
+                timeout = float(timeout_str)
             except ValueError:
-                logger.warning(f"Invalid OTEL_EXPORTER_OTLP_TIMEOUT value '{otlp_timeout}', using default 30.0")
+                logger.warning(f"Invalid timeout value '{timeout_str}', using default 30.0")
         
         # Create OTLP exporter with authentication headers and timeout
         # The exporter will set Content-Type and other headers automatically
@@ -374,6 +372,16 @@ def get_aiqa_tracer() -> trace.Tracer:
         return trace.get_tracer(AIQA_TRACER_NAME)
 
 
+def _get_json(path_suffix: str, operation: str, server_url: Optional[str] = None, api_key: Optional[str] = None) -> Dict[str, Any]:
+    """GET a JSON resource from the AIQA server. Raises on non-OK response."""
+    url = get_server_url(server_url)
+    headers = build_headers(get_api_key(api_key))
+    response = requests.get(f"{url}/{path_suffix}", headers=headers)
+    if not response.ok:
+        raise Exception(format_http_error(response, operation))
+    return response.json()
+
+
 def get_organisation(
     organisation_id: str,
     server_url: Optional[str] = None,
@@ -381,28 +389,16 @@ def get_organisation(
 ) -> Dict[str, Any]:
     """
     Get organisation information based on API key via an API call.
-    
+
     Args:
         organisation_id: ID of the organisation to retrieve
         server_url: Optional server URL (defaults to AIQA_SERVER_URL env var)
         api_key: Optional API key (defaults to AIQA_API_KEY env var)
-    
+
     Returns:
         Organisation object as a dictionary
     """
-    url = get_server_url(server_url)
-    key = get_api_key(api_key)
-    headers = build_headers(key)
-    
-    response = requests.get(
-        f"{url}/organisation/{organisation_id}",
-        headers=headers,
-    )
-    
-    if not response.ok:
-        raise Exception(format_http_error(response, "get organisation"))
-    
-    return response.json()
+    return _get_json(f"organisation/{organisation_id}", "get organisation", server_url, api_key)
 
 
 def get_api_key_info(
@@ -412,25 +408,13 @@ def get_api_key_info(
 ) -> Dict[str, Any]:
     """
     Get API key information via an API call.
-    
+
     Args:
         api_key_id: ID of the API key to retrieve
         server_url: Optional server URL (defaults to AIQA_SERVER_URL env var)
         api_key: Optional API key (defaults to AIQA_API_KEY env var)
-    
+
     Returns:
         ApiKey object as a dictionary
     """
-    url = get_server_url(server_url)
-    key = get_api_key(api_key)
-    headers = build_headers(key)
-    
-    response = requests.get(
-        f"{url}/api-key/{api_key_id}",
-        headers=headers,
-    )
-    
-    if not response.ok:
-        raise Exception(format_http_error(response, "get api key info"))
-    
-    return response.json()
+    return _get_json(f"api-key/{api_key_id}", "get api key info", server_url, api_key)

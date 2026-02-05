@@ -9,12 +9,12 @@ import dataclasses
 import logging
 from .constants import LOG_TAG
 from datetime import datetime, date, time
-from typing import Any, Callable, Set
+from typing import Any, Callable, Optional, Set
 from json.encoder import JSONEncoder
 
 logger = logging.getLogger(LOG_TAG)
 
-def sanitize_string_for_utf8(text: str) -> str:
+def sanitize_string_for_utf8(text: Optional[str]) -> Optional[str]:
     """
     Sanitize a string to remove surrogate characters that can't be encoded to UTF-8.
     Surrogate characters (U+D800 to U+DFFF) are invalid in UTF-8 and can cause encoding errors.
@@ -98,6 +98,14 @@ def _is_api_key(value: Any) -> bool:
     ]
     return any(value.startswith(prefix) for prefix in api_key_prefixes)
 
+def _is_private_key(key: Any) -> bool:
+    """Return True if key should be omitted from serialized output (e.g. leading underscore)."""
+    if isinstance(key, str):
+        return key.startswith("_")
+    # Allow non-string keys (e.g. int) through
+    return False
+
+
 def _apply_data_filters(key: str, value: Any) -> Any:
     """Apply data filters to a key-value pair based on enabled filters."""
     if not value:  # Don't filter falsy values
@@ -120,7 +128,7 @@ def _apply_data_filters(key: str, value: Any) -> Any:
     # RemoveAPIKeys filter: if key contains API key patterns or value looks like an API key
     if "RemoveAPIKeys" in _ENABLED_FILTERS:
         # Check key patterns
-        api_key_key_patterns = ['api_key', 'apikey', 'api-key', 'apikey']
+        api_key_key_patterns = ['api_key', 'apikey', 'api-key']
         if any(pattern in key_lower for pattern in api_key_key_patterns):
             return "****"
         # Check value patterns
@@ -171,7 +179,7 @@ def safe_str_repr(value: Any) -> str:
     """
     Safely convert a value to string representation.
     Handles objects with __repr__ that might raise exceptions.
-    Uses AIQA_MAX_OBJECT_STR_CHARS environment variable (default: 100000) to limit length.
+    Uses AIQA_MAX_OBJECT_STR_CHARS env var (default "1m") to limit length.
     Also sanitizes surrogate characters to prevent UTF-8 encoding errors.
     """
     try:
@@ -233,6 +241,8 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
         for k, v in obj.items():
             try:
                 key_str = str(k) if not isinstance(k, (str, int, float, bool)) else k
+                if _is_private_key(key_str):
+                    continue
                 filtered_value = _apply_data_filters(key_str, v)
                 result[key_str] = object_to_dict(filtered_value, visited, max_depth, current_depth + 1)
             except Exception as e:
@@ -263,6 +273,8 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
         try:
             result = {}
             for field in dataclasses.fields(obj):
+                if _is_private_key(field.name):
+                    continue
                 try:
                     value = getattr(obj, field.name, None)
                     filtered_value = _apply_data_filters(field.name, value)
@@ -278,13 +290,20 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
             logger.debug(f"Failed to convert dataclass {type(obj).__name__} to dict: {e}")
             return safe_str_repr(obj)
     
-    # Handle objects with __dict__
+    # Handle objects with __dict__ (e.g. ORM models like SQLAlchemy)
+    # Strip private keys (e.g. _sa_instance_state) at the source so they never enter the serialized output.
     if hasattr(obj, "__dict__"):
         visited.add(obj_id)
         try:
             obj_dict = obj.__dict__
-            return object_to_dict(obj_dict, visited, max_depth, current_depth) # Note: Don't count using __dict__ as a recursion depth +1 step
-        except Exception as e: # paranoia: object_to_dict should never raise an exception
+            filtered_dict = {}
+            for k, v in obj_dict.items():
+                key_str = str(k) if not isinstance(k, (str, int, float, bool)) else k
+                if _is_private_key(key_str):
+                    continue
+                filtered_dict[key_str] = v
+            return object_to_dict(filtered_dict, visited, max_depth, current_depth)  # Don't count __dict__ as +1 depth
+        except Exception as e:  # paranoia: object_to_dict should never raise an exception
             visited.discard(obj_id)
             logger.debug(f"Failed to convert object {type(obj).__name__} with __dict__ to dict: {e}")
             return safe_str_repr(obj)
@@ -295,6 +314,8 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
         try:
             result = {}
             for slot in obj.__slots__:
+                if _is_private_key(slot):
+                    continue
                 try:
                     if hasattr(obj, slot):
                         value = getattr(obj, slot, None)
@@ -368,7 +389,7 @@ def safe_json_dumps(value: Any) -> str:
     Args:
         value: The value to serialize
 
-    Uses AIQA_MAX_OBJECT_STR_CHARS environment variable (default: 1000000) to limit length.
+    Uses AIQA_MAX_OBJECT_STR_CHARS env var (default "1m" = 1 MiB in chars) to limit length.
     
     Returns:
         JSON string representation

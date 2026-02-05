@@ -397,10 +397,10 @@ def _finalize_span_success_common(
     _extract_and_set_token_usage(span, result_for_metadata)
     _extract_and_set_provider_and_model(span, result_for_metadata)
     
-    # Prepare, filter, and serialize output (serialization happens in _prepare_and_filter_output)
+    # Prepare, filter, and serialize output (serialization happens in _filter_and_serialize_output)
     output_data = _filter_and_serialize_output(output_data, filter_output, ignore_output)
     if output_data is not None:
-        # output_data is already serialized (immutable) from _prepare_and_filter_output
+        # output_data is already serialized (immutable) from _filter_and_serialize_output
         span.set_attribute("output", output_data)
     span.set_status(Status(StatusCode.OK))
 
