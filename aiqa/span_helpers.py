@@ -90,6 +90,7 @@ def set_token_usage(
     input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
     total_tokens: Optional[int] = None,
+    cached_input_tokens: Optional[int] = None,
 ) -> bool:
     """
     Set token usage attributes on the active span using OpenTelemetry semantic conventions for gen_ai.
@@ -101,6 +102,8 @@ def set_token_usage(
         input_tokens: Number of input tokens used (maps to gen_ai.usage.input_tokens)
         output_tokens: Number of output tokens generated (maps to gen_ai.usage.output_tokens)
         total_tokens: Total number of tokens used (maps to gen_ai.usage.total_tokens)
+        cached_input_tokens: Number of cached input tokens used
+            (maps to gen_ai.usage.cached_input_tokens)
     Zero is valid (e.g. when the traced function did not call an LLM).
     
     Returns:
@@ -135,6 +138,9 @@ def set_token_usage(
             set_count += 1
         if total_tokens is not None:
             span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
+            set_count += 1
+        if cached_input_tokens is not None:
+            span.set_attribute("gen_ai.usage.cached_input_tokens", cached_input_tokens)
             set_count += 1
     except Exception as e:
         logger.warning(f"Failed to set token usage attributes: {e}")
@@ -497,5 +503,4 @@ async def submit_feedback(
     except Exception:
         span.end()
         raise
-
 

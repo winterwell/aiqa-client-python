@@ -19,6 +19,9 @@ from .llm_as_judge import score_llm_metric_local, get_model_from_server, call_ll
 import requests
 from .types import MetricResult, ScoreThisInputOutputMetricType, Example, Result, Metric, CallLLMType, CallMyCodeType
 
+AIQA_EXPERIMENT_ID_ATTR = "aiqa.experiment"
+AIQA_EXAMPLE_ID_ATTR = "aiqa.example"
+
 
 def _metric_score_key(metric: Dict[str, Any]) -> str:
     """Key for scores in API: server and webapp expect metric id (fallback to name)."""
@@ -255,9 +258,83 @@ class ExperimentRunner:
             engine: Function that takes input, returns output (can be async)
             scorer: Optional function that scores the output given the example
         """
+        await self.run_some_examples(call_my_code, scorer_for_metric_id)
+
+    def get_experiment(self) -> Optional[Dict[str, Any]]:
+        """
+        Fetch the current experiment by ID.
+
+        Returns:
+            Experiment object, or None if no experiment_id is set.
+        """
+        if not self.experiment_id:
+            return None
+
+        response = requests.get(
+            f"{self.server_url}/experiment/{self.experiment_id}",
+            headers=self._get_headers(),
+        )
+        if not response.ok:
+            raise Exception(format_http_error(response, "fetch experiment"))
+
+        self.experiment = parse_json_response(response, "fetch experiment")
+        return self.experiment
+
+    async def run_some_examples(
+        self,
+        call_my_code: CallMyCodeType,
+        scorer_for_metric_id: Optional[Dict[str, ScoreThisInputOutputMetricType]] = None,
+        tag: str = "",
+        limit: int = 0,
+    ) -> int:
+        """
+        Run an engine function on all or some examples and score the results.
+        Supports filtering by tag and limiting the number of examples.
+        Automatically skips examples that already have results in the experiment.
+
+        Args:
+            call_my_code: Function that takes input, returns output (can be async)
+            scorer_for_metric_id: Optional map of metric_id -> scorer function
+            tag: Optional tag to filter examples by
+            limit: Optional max number of examples to run after filtering (0 means no limit)
+
+        Returns:
+            Number of examples run in this invocation.
+        """
+        if not self.experiment and self.experiment_id:
+            self.experiment = self.get_experiment()
+
         examples = self.get_examples_for_dataset()
 
-        for example in examples:
+        if tag:
+            examples = [
+                example
+                for example in examples
+                if isinstance(example.get("tags"), list) and tag in example.get("tags", [])
+            ]
+
+        if limit and limit > 0:
+            examples = examples[:limit]
+
+        existing_result_example_ids = set()
+        if self.experiment and isinstance(self.experiment.get("results"), list):
+            existing_result_example_ids = {
+                result.get("example")
+                for result in self.experiment["results"]
+                if isinstance(result, dict) and result.get("example")
+            }
+
+        pending_examples = [
+            example
+            for example in examples
+            if example.get("id") not in existing_result_example_ids
+        ]
+        skipped_count = len(examples) - len(pending_examples)
+        if skipped_count:
+            print(f"Skipping {skipped_count} example(s) with existing results")
+
+        run_count = 0
+        for example in pending_examples:
             try:
                 scores = await self.run_example(example, call_my_code, scorer_for_metric_id)
                 if scores:
@@ -268,9 +345,12 @@ class ExperimentRunner:
                             "scores": scores,
                         }
                     )
+                run_count += 1
             except Exception as e:
                 print(f"Error processing example {example.get('id', 'unknown')}: {e}")
                 # Continue with next example instead of failing entire run
+
+        return run_count
 
     async def run_example(
         self,
@@ -328,6 +408,9 @@ class ExperimentRunner:
             async def wrapped_engine(input_data, parameters, set_trace_id: Callable[[Optional[str]], None]):
                 trace_id_here = get_active_trace_id()
                 set_trace_id(trace_id_here)
+                if self.experiment_id:
+                    set_span_attribute(AIQA_EXPERIMENT_ID_ATTR, self.experiment_id)
+                set_span_attribute(AIQA_EXAMPLE_ID_ATTR, example_id)
                 result = call_my_code(input_data, parameters)
                 # Handle async functions
                 if hasattr(result, "__await__"):
@@ -441,5 +524,3 @@ class ExperimentRunner:
         return await score_llm_metric_local(
             input_data, output, example, metric, llm_call_fn
         )
-
-

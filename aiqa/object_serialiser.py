@@ -199,7 +199,13 @@ def safe_str_repr(value: Any) -> str:
             return "<unknown object>"
 
 
-def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_depth: int = 0) -> Any:
+def object_to_dict(
+    obj: Any,
+    visited: Set[int],
+    max_depth: int = 10,
+    current_depth: int = 0,
+    strip_private_keys: bool = True,
+) -> Any:
     """
     Convert an object to a dictionary representation. Applies data filters to the object.
     
@@ -241,10 +247,12 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
         for k, v in obj.items():
             try:
                 key_str = str(k) if not isinstance(k, (str, int, float, bool)) else k
-                if _is_private_key(key_str):
+                if strip_private_keys and _is_private_key(key_str):
                     continue
                 filtered_value = _apply_data_filters(key_str, v)
-                result[key_str] = object_to_dict(filtered_value, visited, max_depth, current_depth + 1)
+                result[key_str] = object_to_dict(
+                    filtered_value, visited, max_depth, current_depth + 1, strip_private_keys
+                )
             except Exception as e:
                 # If one key-value pair fails, log and use string representation for the value
                 key_str = str(k) if not isinstance(k, (str, int, float, bool)) else k
@@ -259,7 +267,9 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
         result = []
         for item in obj:
             try:
-                result.append(object_to_dict(item, visited, max_depth, current_depth + 1))
+                result.append(
+                    object_to_dict(item, visited, max_depth, current_depth + 1, strip_private_keys)
+                )
             except Exception as e:
                 # If one item fails, log and use its string representation
                 logger.debug(f"Failed to convert list item {type(item).__name__} to dict: {e}")
@@ -273,12 +283,14 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
         try:
             result = {}
             for field in dataclasses.fields(obj):
-                if _is_private_key(field.name):
+                if strip_private_keys and _is_private_key(field.name):
                     continue
                 try:
                     value = getattr(obj, field.name, None)
                     filtered_value = _apply_data_filters(field.name, value)
-                    result[field.name] = object_to_dict(filtered_value, visited, max_depth, current_depth + 1)
+                    result[field.name] = object_to_dict(
+                        filtered_value, visited, max_depth, current_depth + 1, strip_private_keys
+                    )
                 except Exception as e:
                     # If accessing a field fails, log and skip it
                     logger.debug(f"Failed to access field {field.name} on {type(obj).__name__}: {e}")
@@ -299,10 +311,12 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
             filtered_dict = {}
             for k, v in obj_dict.items():
                 key_str = str(k) if not isinstance(k, (str, int, float, bool)) else k
-                if _is_private_key(key_str):
+                if strip_private_keys and _is_private_key(key_str):
                     continue
                 filtered_dict[key_str] = v
-            return object_to_dict(filtered_dict, visited, max_depth, current_depth)  # Don't count __dict__ as +1 depth
+            return object_to_dict(
+                filtered_dict, visited, max_depth, current_depth, strip_private_keys
+            )  # Don't count __dict__ as +1 depth
         except Exception as e:  # paranoia: object_to_dict should never raise an exception
             visited.discard(obj_id)
             logger.debug(f"Failed to convert object {type(obj).__name__} with __dict__ to dict: {e}")
@@ -314,13 +328,15 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
         try:
             result = {}
             for slot in obj.__slots__:
-                if _is_private_key(slot):
+                if strip_private_keys and _is_private_key(slot):
                     continue
                 try:
                     if hasattr(obj, slot):
                         value = getattr(obj, slot, None)
                         filtered_value = _apply_data_filters(slot, value)
-                        result[slot] = object_to_dict(filtered_value, visited, max_depth, current_depth + 1)
+                        result[slot] = object_to_dict(
+                            filtered_value, visited, max_depth, current_depth + 1, strip_private_keys
+                        )
                 except Exception as e:
                     # If accessing a slot fails, log and skip it
                     logger.debug(f"Failed to access slot {slot} on {type(obj).__name__}: {e}")
@@ -339,7 +355,9 @@ def object_to_dict(obj: Any, visited: Set[int], max_depth: int = 10, current_dep
             if hasattr(obj, attr):
                 value = getattr(obj, attr, None)
                 filtered_value = _apply_data_filters(attr, value)
-                result[attr] = object_to_dict(filtered_value, visited, max_depth, current_depth + 1)
+                result[attr] = object_to_dict(
+                    filtered_value, visited, max_depth, current_depth + 1, strip_private_keys
+                )
         if result:
             return result
     except Exception:
@@ -379,7 +397,7 @@ class SizeLimitedJSONEncoder(JSONEncoder):
             yield chunk
 
 
-def safe_json_dumps(value: Any) -> str:
+def safe_json_dumps(value: Any, strip_private_keys: bool = True) -> str:
     """
     Safely serialize a value to JSON string with safeguards against:
     - Circular references
@@ -400,7 +418,7 @@ def safe_json_dumps(value: Any) -> str:
     # Convert the entire structure to json-friendy form, and ensure circular references are detected
     # across the whole object graph
     try:
-        converted = object_to_dict(value, visited)
+        converted = object_to_dict(value, visited, strip_private_keys=strip_private_keys)
     except Exception as e:
         # Note: object_to_dict is very defensive but can still raise in rare edge cases:
         # - Objects with corrupted type metadata causing isinstance()/hasattr() to fail
@@ -438,4 +456,3 @@ def safe_json_dumps(value: Any) -> str:
         logger.debug(f"json.dumps total fail for {type(value).__name__}: {e}")
         # Final fallback
         return safe_str_repr(value)
-

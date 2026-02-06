@@ -113,10 +113,15 @@ class TestSetTokenUsage:
         mock_span.is_recording.return_value = True
         
         with patch('opentelemetry.trace.get_current_span', return_value=mock_span):
-            result = set_token_usage(input_tokens=10, output_tokens=20, total_tokens=30)
+            result = set_token_usage(
+                input_tokens=10,
+                output_tokens=20,
+                total_tokens=30,
+                cached_input_tokens=5,
+            )
             
             assert result is True
-            assert mock_span.set_attribute.call_count == 3
+            assert mock_span.set_attribute.call_count == 4
 
     def test_set_token_usage_partial(self):
         """Test setting partial token usage."""
@@ -128,6 +133,19 @@ class TestSetTokenUsage:
             
             assert result is True
             mock_span.set_attribute.assert_called_once()
+
+    def test_set_token_usage_cached_input_tokens(self):
+        """Test setting cached input token usage attribute."""
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = True
+
+        with patch('opentelemetry.trace.get_current_span', return_value=mock_span):
+            result = set_token_usage(cached_input_tokens=42)
+
+            assert result is True
+            mock_span.set_attribute.assert_called_once_with(
+                "gen_ai.usage.cached_input_tokens", 42
+            )
 
     def test_set_token_usage_no_span(self):
         """Test set_token_usage returns False when no active span."""
@@ -342,4 +360,3 @@ class TestFlushTracing:
         with patch('aiqa.span_helpers.get_aiqa_client', return_value=mock_client):
             await flush_tracing()
             # Should not raise error
-

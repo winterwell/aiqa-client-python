@@ -12,7 +12,7 @@ from opentelemetry.trace import Status, StatusCode
 
 from .client import get_aiqa_client, get_component_tag, get_aiqa_tracer
 from .constants import LOG_TAG
-from .object_serialiser import serialize_for_span
+from .object_serialiser import serialize_for_span, safe_json_dumps
 from .tracing_llm_utils import _extract_and_set_token_usage, _extract_and_set_provider_and_model
 
 logger = logging.getLogger(LOG_TAG)
@@ -360,6 +360,8 @@ def _filter_and_serialize_output(
         logger.warning(f"_filter_and_serialize_output: skip: ignore patterns are set but output_data is not a dict: {type(output_data)}")
     
     # Serialize immediately to create immutable result (removes mutable structures)
+    if isinstance(output_data, (dict, list, tuple)):
+        return safe_json_dumps(output_data, strip_private_keys=False)
     return serialize_for_span(output_data)
 
 
@@ -660,7 +662,10 @@ def WithTracing(
             if input_data is not None:
                 # Serialize input immediately to capture state at function start
                 # input_data has already been copied in _prepare_and_filter_input
-                span.set_attribute("input", serialize_for_span(input_data))
+                if isinstance(input_data, (dict, list, tuple)):
+                    span.set_attribute("input", safe_json_dumps(input_data, strip_private_keys=False))
+                else:
+                    span.set_attribute("input", serialize_for_span(input_data))
             
             trace_id = format(span.get_span_context().trace_id, "032x")
             logger.debug(f"do traceable stuff {fn_name} {trace_id}")
@@ -840,6 +845,5 @@ def WithTracing(
         return decorator
     else:
         return decorator(func)
-
 
 

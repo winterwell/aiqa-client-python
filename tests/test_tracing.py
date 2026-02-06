@@ -857,7 +857,8 @@ class TestDefaultUnderscoreIgnore:
             "_top_level": "value5"
         }
         
-        result = _apply_ignore_patterns(data, None)
+        # _apply_ignore_patterns only applies explicit patterns; default patterns are merged elsewhere.
+        result = _apply_ignore_patterns(data, ["_*"])
         
         assert "level1" in result
         assert "public" in result["level1"]

@@ -30,6 +30,8 @@ class MetricResult(TypedDict):
 class Result(TypedDict):
   """Result of evaluating a set of metrics on an output (i.e. the full set of metrics for a single example)."""
   example: str
+  trace: Optional[str] = None
+  rateLimited: Optional[bool] = None
   scores: Dict[str, Number]
   messages: Optional[Dict[str, str]] = None
   errors: Optional[Dict[str, str]] = None
