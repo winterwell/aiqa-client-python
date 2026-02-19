@@ -493,7 +493,7 @@ async def submit_feedback(
             span.set_attribute('feedback.comment', comment)
         
         # Mark as feedback span
-        span.set_attribute('aiqa.span_type', 'feedback')
+        span.set_attribute(GEN_AI_OPERATION_NAME, 'feedback')
         
         # End the span
         span.end()
