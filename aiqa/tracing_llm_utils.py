@@ -56,14 +56,29 @@ def _extract_and_set_token_usage(span: trace.Span, result: Any) -> None:
     using OpenTelemetry semantic conventions for gen_ai.
     
     Looks for usage dict or object with prompt_tokens, completion_tokens, and total_tokens.
-    Sets gen_ai.usage.input_tokens, gen_ai.usage.output_tokens, and gen_ai.usage.total_tokens.
+    Sets gen_ai.usage.input_tokens, gen_ai.usage.output_tokens, gen_ai.usage.total_tokens,
+    gen_ai.usage.cache_read.input_tokens, and gen_ai.usage.cache_creation.input_tokens (cache writes).
     Only sets attributes that are not already set.
     
-    This function detects token usage from OpenAI API response patterns:
-    - OpenAI Chat Completions API: The 'usage' object (dict or Usage object) contains 'prompt_tokens', 'completion_tokens', and 'total_tokens'.
-      See https://platform.openai.com/docs/api-reference/chat/object (usage field)
-    - OpenAI Completions API: The 'usage' object contains 'prompt_tokens', 'completion_tokens', and 'total_tokens'.
-      See https://platform.openai.com/docs/api-reference/completions/object (usage field)
+    This function detects token usage from common API response patterns:
+    - OpenAI Chat Completions API: the 'usage' object (dict or Usage object) contains
+      'prompt_tokens', 'completion_tokens', and 'total_tokens'.
+      See https://platform.openai.com/docs/api-reference/chat/object (usage field).
+    - OpenAI Completions API: the 'usage' object contains 'prompt_tokens',
+      'completion_tokens', and 'total_tokens'.
+      See https://platform.openai.com/docs/api-reference/completions/object (usage field).
+      OpenAI prompt caching reports cached tokens via `prompt_tokens_details.cached_tokens`;
+      these cached tokens are already included in `prompt_tokens`, so we MUST NOT add them
+      again or we would double-count. See
+      https://platform.openai.com/docs/guides/prompt-caching for details.
+    - Bedrock-style usage: usage may include input/output tokens plus
+      cache_read_input_tokens / CacheReadInputTokens (cache hits) and
+      cache_creation_input_tokens / CacheWriteInputTokens / CacheCreationInputTokens
+      (cache writes). In Bedrock, `input_tokens` excludes cache reads, so to follow the
+      OpenTelemetry convention that input_tokens SHOULD include cached tokens, we add
+      cache_read_input_tokens onto input_tokens. See
+      https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_TokenUsage.html
+      and https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html.
     
     Handles both dict and object cases (e.g., OpenAI SDK Usage objects).
     
@@ -108,33 +123,40 @@ def _extract_and_set_token_usage(span: trace.Span, result: Any) -> None:
                 if isinstance(usage, dict):
                     prompt_tokens = _get(usage, "prompt_tokens", "PromptTokens")
                     completion_tokens = _get(usage, "completion_tokens", "CompletionTokens")
-                    input_tokens = _get(usage, "input_tokens", "InputTokens")
+                    uncached_input_tokens = _get(usage, "input_tokens", "InputTokens") # Is this uncached input tokens or all input tokens?? Does it depend on the provider??
                     output_tokens = _get(usage, "output_tokens", "OutputTokens")
                     total_tokens = _get(usage, "total_tokens", "TotalTokens")
-                # Handle object case (e.g., OpenAI Usage object)
+                    cached_input_tokens = _get(usage, "cache_read_input_tokens", "CacheReadInputTokens")
+                    cache_write_tokens = _get(usage, "cache_creation_input_tokens", "CacheWriteInputTokens", "CacheCreationInputTokens")
                 else:
-                  
                     prompt_tokens = _attr(usage, "prompt_tokens", "PromptTokens")
                     completion_tokens = _attr(usage, "completion_tokens", "CompletionTokens")
-                    input_tokens = _attr(usage, "input_tokens", "InputTokens")
+                    uncached_input_tokens = _attr(usage, "input_tokens", "InputTokens")
                     output_tokens = _attr(usage, "output_tokens", "OutputTokens")
                     total_tokens = _attr(usage, "total_tokens", "TotalTokens")
+                    cached_input_tokens = _attr(usage, "cache_read_input_tokens", "CacheReadInputTokens")
+                    cache_write_tokens = _attr(usage, "cache_creation_input_tokens", "CacheWriteInputTokens", "CacheCreationInputTokens")
                 
                 # Use Bedrock format if OpenAI format not available
                 if prompt_tokens is None:
-                    prompt_tokens = input_tokens
+                    prompt_tokens = uncached_input_tokens
                 if completion_tokens is None:
                     completion_tokens = output_tokens
-                
-                # Calculate total_tokens if not provided but we have input and output
-                if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
-                    total_tokens = prompt_tokens + completion_tokens
+                # Input tokens should include cached (otel convention: input_tokens = non-cached + cached)
+                if prompt_tokens is not None and cached_input_tokens is not None:
+                    prompt_tokens = prompt_tokens + cached_input_tokens
                 
                 # Only set attributes that are not already set
+                if cached_input_tokens is not None and not _is_attribute_set(span, "gen_ai.usage.cache_read.input_tokens"):
+                    span.set_attribute("gen_ai.usage.cache_read.input_tokens", cached_input_tokens)
+                if cache_write_tokens is not None and not _is_attribute_set(span, "gen_ai.usage.cache_creation.input_tokens"):
+                    span.set_attribute("gen_ai.usage.cache_creation.input_tokens", cache_write_tokens)
                 if prompt_tokens is not None and not _is_attribute_set(span, "gen_ai.usage.input_tokens"):
                     span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
                 if completion_tokens is not None and not _is_attribute_set(span, "gen_ai.usage.output_tokens"):
                     span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
+                if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+                    total_tokens = prompt_tokens + completion_tokens
                 if total_tokens is not None and not _is_attribute_set(span, "gen_ai.usage.total_tokens"):
                     span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
             except Exception:

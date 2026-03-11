@@ -109,12 +109,18 @@ class ExperimentRunner:
         )
         return response.json()
 
-    def get_examples_for_dataset(self, limit: int = 10000) -> List[Dict[str, Any]]:
+    def get_examples_for_dataset(
+        self,
+        limit: int = 10000,
+        example_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Fetch example inputs from the dataset.
 
         Args:
             limit: Maximum number of examples to fetch (default: 10000)
+            example_filter: Optional server-side filter, e.g. "id:example-id" or "tags:tag1,tag2".
+                Passed as query param 'q' to the examples API.
 
         Returns:
             List of example objects
@@ -129,6 +135,8 @@ class ExperimentRunner:
         }
         if self.organisation:
             params["organisation"] = self.organisation
+        if example_filter:
+            params["q"] = example_filter
 
         response = requests.get(
             f"{self.server_url}/example",
@@ -255,8 +263,8 @@ class ExperimentRunner:
         Run an engine function on all examples and score the results.
 
         Args:
-            engine: Function that takes input, returns output (can be async)
-            scorer: Optional function that scores the output given the example
+            call_my_code: Function that takes input, returns output (can be async)
+            scorer_for_metric_id: Optional map of metric_id -> scorer function
         """
         await self.run_some_examples(call_my_code, scorer_for_metric_id)
 
@@ -286,17 +294,25 @@ class ExperimentRunner:
         scorer_for_metric_id: Optional[Dict[str, ScoreThisInputOutputMetricType]] = None,
         tag: str = "",
         limit: int = 0,
+        example_filter: Optional[str] = None,
+        rerun_examples: bool = False,
+        rerun_examples_with_missing_scores: bool = False,
     ) -> int:
         """
         Run an engine function on all or some examples and score the results.
-        Supports filtering by tag and limiting the number of examples.
-        Automatically skips examples that already have results in the experiment.
+        Supports filtering by tag, example_filter (server-side), and limit.
+        By default skips examples that already have results; use rerun_examples or
+        rerun_examples_with_missing_scores to re-run some or all of them.
 
         Args:
             call_my_code: Function that takes input, returns output (can be async)
             scorer_for_metric_id: Optional map of metric_id -> scorer function
-            tag: Optional tag to filter examples by
+            tag: Optional tag to filter examples by (client-side, applied after fetch)
             limit: Optional max number of examples to run after filtering (0 means no limit)
+            example_filter: Optional server-side filter, e.g. "id:example-id" or "tags:tag1,tag2"
+            rerun_examples: If True, run all fetched examples even if they already have results.
+            rerun_examples_with_missing_scores: If True (and rerun_examples is False), re-run
+                examples that have a result but are missing a score for at least one metric.
 
         Returns:
             Number of examples run in this invocation.
@@ -304,7 +320,7 @@ class ExperimentRunner:
         if not self.experiment and self.experiment_id:
             self.experiment = self.get_experiment()
 
-        examples = self.get_examples_for_dataset()
+        examples = self.get_examples_for_dataset(limit=limit or 10000, example_filter=example_filter)
 
         if tag:
             examples = [
@@ -316,22 +332,49 @@ class ExperimentRunner:
         if limit and limit > 0:
             examples = examples[:limit]
 
-        existing_result_example_ids = set()
+        existing_results_by_example: Dict[str, Dict[str, Any]] = {}
         if self.experiment and isinstance(self.experiment.get("results"), list):
-            existing_result_example_ids = {
-                result.get("example")
-                for result in self.experiment["results"]
-                if isinstance(result, dict) and result.get("example")
-            }
+            for result in self.experiment["results"]:
+                if isinstance(result, dict) and result.get("example"):
+                    existing_results_by_example[result["example"]] = result
 
-        pending_examples = [
-            example
-            for example in examples
-            if example.get("id") not in existing_result_example_ids
-        ]
-        skipped_count = len(examples) - len(pending_examples)
-        if skipped_count:
-            print(f"Skipping {skipped_count} example(s) with existing results")
+        if rerun_examples:
+            pending_examples = examples
+            if examples:
+                print(f"Rerunning {len(examples)} example(s) even if they have results")
+        else:
+            dataset_metrics: List[Dict[str, Any]] = []
+            if rerun_examples_with_missing_scores:
+                dataset_metrics = self.get_dataset().get("metrics", [])
+
+            def _metrics_for_example(ex: Dict[str, Any]) -> List[Dict[str, Any]]:
+                ex_metrics = ex.get("metrics") or []
+                return [*dataset_metrics, *ex_metrics]
+
+            def _has_all_scores(ex: Dict[str, Any], result: Dict[str, Any]) -> bool:
+                scores = result.get("scores") or {}
+                for m in _metrics_for_example(ex):
+                    key = _metric_score_key(m)
+                    if not key:
+                        continue
+                    if key not in scores:
+                        return False
+                return True
+
+            pending_examples = []
+            skipped_count = 0
+            for example in examples:
+                ex_id = example.get("id")
+                existing = existing_results_by_example.get(ex_id) if ex_id else None
+                if not existing:
+                    pending_examples.append(example)
+                    continue
+                if rerun_examples_with_missing_scores and not _has_all_scores(example, existing):
+                    pending_examples.append(example)
+                    continue
+                skipped_count += 1
+            if skipped_count:
+                print(f"Skipping {skipped_count} example(s) with existing results")
 
         run_count = 0
         for example in pending_examples:

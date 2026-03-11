@@ -25,7 +25,9 @@ from aiqa.span_helpers import (
     submit_feedback,
     flush_tracing,
 )
+from dotenv import load_dotenv
 
+load_dotenv()
 
 class TestSetSpanAttribute:
     """Tests for set_span_attribute function."""
@@ -117,7 +119,7 @@ class TestSetTokenUsage:
                 input_tokens=10,
                 output_tokens=20,
                 total_tokens=30,
-                cached_input_tokens=5,
+                cache_read_input_tokens=5,
             )
             
             assert result is True
@@ -134,17 +136,23 @@ class TestSetTokenUsage:
             assert result is True
             mock_span.set_attribute.assert_called_once()
 
-    def test_set_token_usage_cached_input_tokens(self):
-        """Test setting cached input token usage attribute."""
+    def test_set_token_usage_cache_read_and_creation(self):
+        """Test setting cache read and cache creation token usage attributes."""
         mock_span = MagicMock()
         mock_span.is_recording.return_value = True
 
         with patch('opentelemetry.trace.get_current_span', return_value=mock_span):
-            result = set_token_usage(cached_input_tokens=42)
+            result = set_token_usage(
+                cache_read_input_tokens=42,
+                cache_creation_input_tokens=7,
+            )
 
             assert result is True
-            mock_span.set_attribute.assert_called_once_with(
-                "gen_ai.usage.cached_input_tokens", 42
+            mock_span.set_attribute.assert_any_call(
+                "gen_ai.usage.cache_read.input_tokens", 42
+            )
+            mock_span.set_attribute.assert_any_call(
+                "gen_ai.usage.cache_creation.input_tokens", 7
             )
 
     def test_set_token_usage_no_span(self):
@@ -301,40 +309,26 @@ class TestGetSpan:
         span_data = {"id": "span-123", "name": "test"}
         mock_response_data = {"hits": [span_data]}
 
-        with patch.dict(
-            os.environ,
-            {
-                "AIQA_SERVER_URL": "http://localhost:3000",
-                "AIQA_API_KEY": "test-key",
-                "AIQA_ORGANISATION_ID": "test-org",
-            },
-        ):
-            with patch("requests.get") as mock_get:
-                mock_response = MagicMock()
-                mock_response.status_code = 200
-                mock_response.json.return_value = mock_response_data
-                mock_get.return_value = mock_response
+        # Rely on real environment (.env) for URL / API key / org.
+        with patch("requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = mock_response_data
+            mock_get.return_value = mock_response
 
-                result = get_span("span-123")
-                assert result == span_data
+            result = get_span("span-123")
+            assert result == span_data
 
     def test_get_span_not_found(self):
         """Test get_span returns None when not found."""
-        with patch.dict(
-            os.environ,
-            {
-                "AIQA_SERVER_URL": "http://localhost:3000",
-                "AIQA_API_KEY": "test-key",
-                "AIQA_ORGANISATION_ID": "test-org",
-            },
-        ):
-            with patch("requests.get") as mock_get:
-                mock_response = MagicMock()
-                mock_response.status_code = 404
-                mock_get.return_value = mock_response
+        # Rely on real environment (.env); only HTTP response is mocked.
+        with patch("requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 404
+            mock_get.return_value = mock_response
 
-                result = get_span("nonexistent")
-                assert result is None
+            result = get_span("nonexistent")
+            assert result is None
 
 
 class TestFlushTracing:

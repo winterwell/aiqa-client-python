@@ -54,7 +54,7 @@ async def test_run_example_sets_aiqa_experiment_attributes(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_some_examples_filters_by_tag_and_limit(monkeypatch):
     runner = ExperimentRunner("dataset-1")
-    runner.get_examples_for_dataset = lambda: [
+    runner.get_examples_for_dataset = lambda limit=10000, example_filter=None: [
         {"id": "e1", "tags": ["a", "b"]},
         {"id": "e2", "tags": ["b"]},
         {"id": "e3", "tags": ["a"]},
@@ -75,7 +75,7 @@ async def test_run_some_examples_filters_by_tag_and_limit(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_some_examples_resumes_and_skips_existing_results(monkeypatch):
     runner = ExperimentRunner("dataset-1", experiment_id="exp-1")
-    runner.get_examples_for_dataset = lambda: [
+    runner.get_examples_for_dataset = lambda limit=10000, example_filter=None: [
         {"id": "e1"},
         {"id": "e2"},
     ]
@@ -90,6 +90,62 @@ async def test_run_some_examples_resumes_and_skips_existing_results(monkeypatch)
         return {"ok": True}
 
     run_count = await runner.run_some_examples(call_my_code)
+
+    assert run_count == 1
+    runner.run_example.assert_awaited_once()
+    called_example = runner.run_example.await_args.args[0]
+    assert called_example["id"] == "e2"
+
+
+@pytest.mark.asyncio
+async def test_run_some_examples_rerun_examples_runs_all(monkeypatch):
+    """When rerun_examples=True, examples with existing results are still run."""
+    runner = ExperimentRunner("dataset-1", experiment_id="exp-1")
+    runner.get_examples_for_dataset = lambda limit=10000, example_filter=None: [
+        {"id": "e1"},
+        {"id": "e2"},
+    ]
+    runner.get_experiment = lambda: {
+        "id": "exp-1",
+        "results": [{"example": "e1", "scores": {"duration": 1}}],
+    }
+    runner.experiment = None
+    runner.run_example = AsyncMock(return_value=[{"example": "e1", "scores": {}}])
+
+    async def call_my_code(input_data, parameters):
+        return {"ok": True}
+
+    run_count = await runner.run_some_examples(call_my_code, rerun_examples=True)
+
+    assert run_count == 2
+    assert runner.run_example.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_some_examples_rerun_examples_with_missing_scores(monkeypatch):
+    """When rerun_examples_with_missing_scores=True, examples missing a score for any metric are re-run."""
+    runner = ExperimentRunner("dataset-1", experiment_id="exp-1")
+    runner._dataset_cache = {"metrics": [{"id": "m1", "name": "Score1"}]}
+    runner.get_examples_for_dataset = lambda limit=10000, example_filter=None: [
+        {"id": "e1", "metrics": []},
+        {"id": "e2", "metrics": []},
+    ]
+    runner.get_experiment = lambda: {
+        "id": "exp-1",
+        "results": [
+            {"example": "e1", "scores": {"m1": 0.5, "duration": 1}},
+            {"example": "e2", "scores": {"duration": 1}},
+        ],
+    }
+    runner.experiment = None
+    runner.run_example = AsyncMock(return_value=[{"example": "e2", "scores": {"m1": 0.3}}])
+
+    async def call_my_code(input_data, parameters):
+        return {"ok": True}
+
+    run_count = await runner.run_some_examples(
+        call_my_code, rerun_examples_with_missing_scores=True
+    )
 
     assert run_count == 1
     runner.run_example.assert_awaited_once()

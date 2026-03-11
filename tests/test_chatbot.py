@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 
 # Mock dependencies before importing chatbot module
-# These patches will remain active for the duration of the test module
 def mock_getenv(key, default=None):
     """Mock os.getenv that returns appropriate values for different env vars."""
     env_vars = {
@@ -18,24 +17,18 @@ def mock_getenv(key, default=None):
     }
     return env_vars.get(key, default)
 
-_mock_get_aiqa_client = patch("aiqa.get_aiqa_client", return_value=Mock())
-_mock_load_dotenv = patch("dotenv.load_dotenv")
-_mock_getenv = patch("os.getenv", side_effect=mock_getenv)
-_mock_openai = patch("openai.OpenAI", return_value=Mock())
-_mock_ddgs = patch("ddgs.DDGS")
-
-_mock_get_aiqa_client.start()
-_mock_load_dotenv.start()
-_mock_getenv.start()
-_mock_openai.start()
-_mock_ddgs.start()
-
 # Add parent directory to Python path so we can import chatbot
 parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir / "examples" / "chatbot"))
 
-# Now import chatbot - the mocks are already in place
-from chatbot import web_search
+# Import chatbot with dependencies patched only during import time,
+# to avoid leaking global patches into other test modules.
+with patch("aiqa.get_aiqa_client", return_value=Mock()), \
+     patch("dotenv.load_dotenv"), \
+     patch("os.getenv", side_effect=mock_getenv), \
+     patch("openai.OpenAI", return_value=Mock()), \
+     patch("ddgs.DDGS"):
+    from chatbot import web_search
 
 
 class TestWebSearch:

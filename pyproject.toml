@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiqa-client"
-version = "0.8.1"
+version = "0.8.5"
 description = "OpenTelemetry-based Python client for tracing functions and sending traces to the AIQA server"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -40,9 +40,14 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "python-dotenv>=1.0.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [project.urls]
 Homepage = "https://github.com/winterwell/aiqa-client-python"

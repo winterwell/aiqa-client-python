@@ -79,3 +79,26 @@ class TestExtractAndSetTokenUsage:
         assert calls.get("gen_ai.usage.input_tokens") == 0
         assert calls.get("gen_ai.usage.output_tokens") == 5
         assert calls.get("gen_ai.usage.total_tokens") == 5
+
+    def test_cache_read_and_cache_creation_tokens_set(self):
+        """Cache read and cache write (creation) token counts are set when present in usage."""
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = True
+        mock_span.attributes = {}
+        mock_span._attributes = {}
+
+        result = {
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 10,
+            }
+        }
+        _extract_and_set_token_usage(mock_span, result)
+
+        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
+        assert calls.get("gen_ai.usage.cache_read.input_tokens") == 20
+        assert calls.get("gen_ai.usage.cache_creation.input_tokens") == 10
+        assert calls.get("gen_ai.usage.input_tokens") == 120  # input_tokens + cache_read
+        assert calls.get("gen_ai.usage.output_tokens") == 50

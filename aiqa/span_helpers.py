@@ -90,7 +90,8 @@ def set_token_usage(
     input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
     total_tokens: Optional[int] = None,
-    cached_input_tokens: Optional[int] = None,
+    cache_read_input_tokens: Optional[int] = None,
+    cache_creation_input_tokens: Optional[int] = None,
 ) -> bool:
     """
     Set token usage attributes on the active span using OpenTelemetry semantic conventions for gen_ai.
@@ -102,8 +103,10 @@ def set_token_usage(
         input_tokens: Number of input tokens used (maps to gen_ai.usage.input_tokens)
         output_tokens: Number of output tokens generated (maps to gen_ai.usage.output_tokens)
         total_tokens: Total number of tokens used (maps to gen_ai.usage.total_tokens)
-        cached_input_tokens: Number of cached input tokens used
-            (maps to gen_ai.usage.cached_input_tokens)
+        cache_read_input_tokens: Number of cached input tokens read from cache
+            (maps to gen_ai.usage.cache_read.input_tokens).
+        cache_creation_input_tokens: Number of input tokens used to create / write cache
+            (maps to gen_ai.usage.cache_creation.input_tokens).
     Zero is valid (e.g. when the traced function did not call an LLM).
     
     Returns:
@@ -119,7 +122,8 @@ def set_token_usage(
             set_token_usage(
                 input_tokens=response.usage.prompt_tokens,
                 output_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens
+                total_tokens=response.usage.total_tokens,
+                cache_read_input_tokens=response.usage.cached_prompt_tokens,
             )
             return response
         # When there was no LLM call: set_token_usage(0, 0, 0)
@@ -127,7 +131,7 @@ def set_token_usage(
     span = trace.get_current_span()
     if not span or not span.is_recording():
         return False
-    
+
     set_count = 0
     try:
         if input_tokens is not None:
@@ -139,8 +143,11 @@ def set_token_usage(
         if total_tokens is not None:
             span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
             set_count += 1
-        if cached_input_tokens is not None:
-            span.set_attribute("gen_ai.usage.cached_input_tokens", cached_input_tokens)
+        if cache_read_input_tokens is not None:
+            span.set_attribute("gen_ai.usage.cache_read.input_tokens", cache_read_input_tokens)
+            set_count += 1
+        if cache_creation_input_tokens is not None:
+            span.set_attribute("gen_ai.usage.cache_creation.input_tokens", cache_creation_input_tokens)
             set_count += 1
     except Exception as e:
         logger.warning(f"Failed to set token usage attributes: {e}")
@@ -416,9 +423,6 @@ def get_span(span_id: str, organisation_id: Optional[str] = None, exclude: Optio
     api_key = get_api_key()
     org_id = organisation_id or os.getenv("AIQA_ORGANISATION_ID", "")
     
-    # Check if server_url is the default (meaning AIQA_SERVER_URL was not set)
-    if not os.getenv("AIQA_SERVER_URL"):
-        raise ValueError("AIQA_SERVER_URL is not set. Cannot retrieve span.")    
     if not org_id:
         raise ValueError("Organisation ID is required. Provide it as parameter or set AIQA_ORGANISATION_ID environment variable.")
     if not api_key:
@@ -493,7 +497,7 @@ async def submit_feedback(
             span.set_attribute('feedback.comment', comment)
         
         # Mark as feedback span
-        span.set_attribute(GEN_AI_OPERATION_NAME, 'feedback')
+        span.set_attribute('gen_ai.operation.name', 'feedback')
         
         # End the span
         span.end()

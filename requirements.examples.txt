@@ -8,5 +8,4 @@ fastapi
 dotenv
 openai>=1.0.0
 ddgs>=5.0.0
-wandb
-weave
+pytest
