@@ -107,6 +107,8 @@ class ExperimentRunner:
             f"{self.server_url}/example/{example_id}",
             headers=self._get_headers(),
         )
+        if not response.ok:
+            raise Exception(format_http_error(response, "fetch example"))
         return response.json()
 
     def get_examples_for_dataset(

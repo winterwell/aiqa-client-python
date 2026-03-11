@@ -26,7 +26,8 @@ def parse_llm_response(content: str) -> Optional[MetricResult]:
     try:
         result = json.loads(content)
         score = result.get("score")
-        if not score:
+        # Accept score=0 as valid; only treat missing score as invalid
+        if score is None:
             return None
         message = result.get("message")
         # Ensure score is in [0, 1] range
